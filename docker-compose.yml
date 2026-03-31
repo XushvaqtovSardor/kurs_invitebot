@@ -1,0 +1,45 @@
+version: '3.9'
+
+services:
+  db:
+    image: postgres:16
+    container_name: kurslar_db
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: 13254
+      POSTGRES_DB: kurslar
+    ports:
+      - '5491:5432'
+    volumes:
+      - baza_data:/var/lib/postgresql/data
+  # redis:
+  #   image: redis:7
+  #   container_name: payment_redis
+  #   restart: always
+  #   ports:
+  #     - '6381:6379'
+  app:
+    build: .
+    container_name: kurslar_bot
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - '3298:3000'
+    depends_on:
+      - db
+      # - redis
+    command: >
+      sh -c "
+        npx prisma generate &&
+        npx prisma migrate deploy &&
+        pnpm run start:dev
+      "
+    environment:
+      DATABASE_URL: postgres://postgres:13254@db:5432/kurslar
+      # REDIS_HOST: redis
+      # REDIS_PORT: 6379
+
+volumes:
+  baza_data:

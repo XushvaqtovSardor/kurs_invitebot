@@ -1,0 +1,58 @@
+name: deploy CI/CD project
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Deploy over SSH and run Docker Compose
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            set -e
+
+            echo "Creating project folder if it doesn't exist!"
+            mkdir -p /root
+            cd /root
+
+            if [ ! -d "5oy_imtihon/.git" ]; then
+              echo "Cloning repository!"
+              git clone https://github.com/XushvaqtovSardor/5oy_imtihon
+            else
+              echo "Pulling latest changes!"
+              cd 5oy_imtihon
+              git pull origin main
+              cd ..
+            fi
+
+            # ALWAYS enter project directory
+            cd 5oy_imtihon
+
+            echo "Stopping containers"
+            docker compose down
+
+            echo "Building containers"
+            docker compose build --no-cache app
+
+            echo "Running containers"
+            docker compose up -d
+
+            echo "Waiting for services to be ready"
+            sleep 10
+
+            echo "Checking container status"
+            docker compose ps
+
+            echo "Checking app logs"
+            docker compose logs --tail=50 app

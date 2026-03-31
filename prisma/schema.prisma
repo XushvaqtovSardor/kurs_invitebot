@@ -7,23 +7,24 @@ datasource db {
 }
 
 model User {
-    id                 Int              @id @default(autoincrement())
-    telegramId         String           @unique
-    username           String?
-    firstName          String?
-    lastName           String?
-    referralCode       String           @unique
-    invitedCount       Int              @default(0)
-    accessGranted      Boolean          @default(false)
-    referralCreditedAt DateTime?
-    state              UserState        @default(IDLE)
-    createdAt          DateTime         @default(now())
-    updatedAt          DateTime         @updatedAt
-    referredById       Int?
-    referredBy         User?            @relation("Referrals", fields: [referredById], references: [id])
-    referrals          User[]           @relation("Referrals")
-    payments           Payment[]
-    messages           SupportMessage[]
+    id                  Int                  @id @default(autoincrement())
+    telegramId          String               @unique
+    username            String?
+    firstName           String?
+    lastName            String?
+    referralCode        String               @unique
+    invitedCount        Int                  @default(0)
+    accessGranted       Boolean              @default(false)
+    referralCreditedAt  DateTime?
+    state               UserState            @default(IDLE)
+    createdAt           DateTime             @default(now())
+    updatedAt           DateTime             @updatedAt
+    referredById        Int?
+    referredBy          User?                @relation("Referrals", fields: [referredById], references: [id])
+    referrals           User[]               @relation("Referrals")
+    payments            Payment[]
+    messages            SupportMessage[]
+    privateAccessGrants PrivateAccessGrant[]
 }
 
 model Channel {
@@ -67,6 +68,21 @@ model Setting {
     value     String
     updatedAt DateTime @updatedAt
     createdAt DateTime @default(now())
+}
+
+model PrivateAccessGrant {
+    id                Int       @id @default(autoincrement())
+    userId            Int
+    user              User      @relation(fields: [userId], references: [id])
+    channelTelegramId String
+    inviteLink        String?
+    isActive          Boolean   @default(true)
+    approvedAt        DateTime?
+    createdAt         DateTime  @default(now())
+    updatedAt         DateTime  @updatedAt
+
+    @@index([channelTelegramId, userId, isActive])
+    @@index([userId, createdAt])
 }
 
 enum UserState {

@@ -26,18 +26,18 @@ jobs:
             mkdir -p /root
             cd /root
 
-            if [ ! -d "5oy_imtihon/.git" ]; then
+            if [ ! -d "kurs_invitebot/.git" ]; then
               echo "Cloning repository!"
-              git clone https://github.com/XushvaqtovSardor/5oy_imtihon
+              git clone https://github.com/XushvaqtovSardor/kurs_invitebot
             else
               echo "Pulling latest changes!"
-              cd 5oy_imtihon
+              cd kurs_invitebot
               git pull origin main
               cd ..
             fi
 
             # ALWAYS enter project directory
-            cd 5oy_imtihon
+            cd kurs_invitebot
 
             echo "Stopping containers"
             docker compose down

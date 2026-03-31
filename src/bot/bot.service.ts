@@ -77,273 +77,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             return;
         }
 
-        // User commands
+        // User command
         this.bot.command('start', async (ctx) => this.handleStart(ctx));
-        this.bot.command('menu', async (ctx) => {
-            if (ctx.from && this.isAdmin(ctx.from.id)) {
-                await this.showAdminPanel(ctx);
-                return;
-            }
-            await this.showUserDashboardOrGate(ctx);
-        });
-        this.bot.command('check', async (ctx) => this.handleCheck(ctx));
-        this.bot.command('stats', async (ctx) => this.showUserStatsByContext(ctx));
-        this.bot.command('ref', async (ctx) => this.handleReferralRequest(ctx));
-        this.bot.command('invites', async (ctx) => this.handleInvitesRequest(ctx));
-        this.bot.command('private', async (ctx) => this.handlePrivateLinkRequest(ctx));
-        this.bot.command('pay', async (ctx) => this.handlePay(ctx));
-        this.bot.command('support', async (ctx) => this.startSupportFlow(ctx));
-
-        // Admin menu
-        this.bot.command('admin', async (ctx) => {
-            if (!ctx.from || !this.isAdmin(ctx.from.id)) {
-                await ctx.reply('Siz admin emassiz.');
-                return;
-            }
-            await this.showAdminPanel(ctx);
-        });
-
-        // Admin settings
-        this.bot.command('setgoal', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            const valueRaw = ctx.message?.text?.split(' ')[1];
-            const value = Number(valueRaw);
-            if (!Number.isInteger(value) || value <= 0) {
-                await ctx.reply('Referral maqsadini musbat butun son sifatida kiriting. Masalan: 5');
-                return;
-            }
-            await this.setSetting(SETTING_REFERRAL_GOAL, String(value));
-            await ctx.reply(`Referral maqsadi ${value} ga o‘rnatildi.`);
-        });
-
-        this.bot.command('setpayment', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            await this.promptSetPaymentDetails(ctx);
-        });
-
-        this.bot.command('setprivatelink', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            await this.promptSetPrivateLink(ctx);
-        });
-
-        this.bot.command('addrequired', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            await this.showRequiredChannelsManager(ctx);
-        });
-
-        this.bot.command('addexternal', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            await this.showRequiredChannelsManager(ctx);
-        });
-
-        this.bot.command('removerequired', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            await this.showRequiredChannelsDeleteMenu(ctx);
-        });
-
-        this.bot.command('setprivate', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            await this.promptSetPrivateChannelId(ctx);
-        });
-
-        this.bot.command('setarchive', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            await this.promptSetDatabaseChannel(ctx);
-        });
-
-        this.bot.command('setdbchannel', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            await this.promptSetDatabaseChannel(ctx);
-        });
-
-        this.bot.command('setposter', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            await this.promptSetReferralPoster(ctx);
-        });
-
-        // Admin info and payments
-        this.bot.command('status', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            const goal = await this.getReferralGoal();
-            const card = (await this.getSetting(SETTING_PAYMENT_CARD)) ?? 'yo‘q';
-            const cardOwner = (await this.getSetting(SETTING_PAYMENT_CARD_OWNER)) ?? 'yo‘q';
-            const amount = (await this.getSetting(SETTING_PAYMENT_AMOUNT)) ?? 'yo‘q';
-            const privateLink = (await this.getSetting(SETTING_PRIVATE_CHANNEL_LINK)) ?? 'yo‘q';
-            const requiredChannels = await this.prisma.channel.findMany({
-                where: { type: ChannelType.REQUIRED, isActive: true },
-            });
-            const requiredCount = requiredChannels.length;
-            const requiredExternalCount = requiredChannels.filter((channel) =>
-                this.isExternalRequiredChannel(channel),
-            ).length;
-            const requiredTelegramCount = requiredCount - requiredExternalCount;
-            const privateChannel = await this.prisma.channel.findFirst({
-                where: { type: ChannelType.PRIVATE_ACCESS, isActive: true },
-            });
-            const databaseChannel = await this.prisma.channel.findFirst({
-                where: { type: ChannelType.RECEIPT_ARCHIVE, isActive: true },
-            });
-
-            await ctx.reply(
-                [
-                    `Referral maqsad: ${goal}`,
-                    `Majburiy kanal soni: ${requiredCount}`,
-                    `- Telegram: ${requiredTelegramCount}`,
-                    `- External: ${requiredExternalCount}`,
-                    `To‘lov karta: ${card}`,
-                    `Karta egasi: ${cardOwner}`,
-                    `To‘lov summa: ${amount}`,
-                    `Yopiq kanal ID: ${privateChannel?.telegramId ?? 'o‘rnatilmagan'}`,
-                    `Yopiq kanal linki: ${privateLink}`,
-                    `Database kanal ID: ${databaseChannel?.telegramId ?? 'o‘rnatilmagan'}`,
-                ].join('\n'),
-            );
-        });
-
-        this.bot.command('admininfo', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            await this.showAdminInfo(ctx);
-        });
-
-        this.bot.command('payments', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            await this.showPaymentSections(ctx);
-        });
-
-        this.bot.command('paydetail', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            const idRaw = ctx.message?.text?.split(' ')[1];
-            const paymentId = Number(idRaw);
-            if (!Number.isInteger(paymentId)) {
-                await ctx.reply('To‘lov ID sini kiriting. Masalan: 12');
-                return;
-            }
-            const payment = await this.prisma.payment.findUnique({
-                where: { id: paymentId },
-                include: { user: true },
-            });
-            if (!payment) {
-                await ctx.reply('To‘lov topilmadi.');
-                return;
-            }
-            const text = [
-                `To‘lov #${payment.id}`,
-                `User: @${payment.user.username ?? 'username yo‘q'}`,
-                `TG ID: ${payment.user.telegramId}`,
-                `Summa: ${payment.amount}`,
-                `Status: ${payment.status}`,
-                `Karta: ${payment.cardNumber}`,
-                payment.rejectionReason ? `Sabab: ${payment.rejectionReason}` : undefined,
-            ]
-                .filter(Boolean)
-                .join('\n');
-            await ctx.reply(text);
-        });
-
-        this.bot.command('payapprove', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            const idRaw = ctx.message?.text?.split(' ')[1];
-            const paymentId = Number(idRaw);
-            if (!Number.isInteger(paymentId)) {
-                await ctx.reply('Tasdiqlash uchun to‘lov ID sini kiriting. Masalan: 12');
-                return;
-            }
-            const result = await this.approvePaymentById(paymentId, String(ctx.from?.id ?? ''));
-            await ctx.reply(result.message);
-            if (!result.ok || !result.user) return;
-
-            await this.notifyUser(
-                result.user.telegramId,
-                'To‘lovingiz muvaffaqiyatli tasdiqlandi. Endi yopiq kanalga kirishingiz mumkin.',
-            );
-            await this.sendPrivateChannelAccessByUser(result.user);
-        });
-
-        this.bot.command('payreject', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            const parts = (ctx.message?.text ?? '').split(' ');
-            const paymentId = Number(parts[1]);
-            const reason = parts.slice(2).join(' ').trim() || 'To‘lov tasdiqlanmadi';
-            if (!Number.isInteger(paymentId)) {
-                await ctx.reply('Rad etish uchun to‘lov ID sini kiriting. Masalan: 12');
-                return;
-            }
-            const result = await this.rejectPaymentById(paymentId, String(ctx.from?.id ?? ''), reason);
-            await ctx.reply(result.message);
-            if (!result.ok || !result.user) return;
-
-            await this.notifyUser(
-                result.user.telegramId,
-                `Chekingiz rad etildi: ${reason}. Iltimos, to‘lovni qayta yuboring yoki supportga yozing.`,
-            );
-        });
-
-        // Support/admin messaging
-        this.bot.command('supportlist', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            await this.showSupportList(ctx);
-        });
-
-        this.bot.command('userstat', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            const arg = ctx.message?.text?.split(' ')[1];
-            if (!arg) {
-                await ctx.reply('Foydalanuvchi ID yoki Telegram ID kiriting.');
-                return;
-            }
-            const byId = Number(arg);
-            const user = Number.isInteger(byId)
-                ? await this.prisma.user.findUnique({ where: { id: byId } })
-                : await this.prisma.user.findUnique({ where: { telegramId: arg } });
-            if (!user) {
-                await ctx.reply('User topilmadi.');
-                return;
-            }
-            const goal = await this.getReferralGoal();
-            const text = [
-                `ID: ${user.id}`,
-                `TG: ${user.telegramId}`,
-                `Username: @${user.username ?? 'yo‘q'}`,
-                `Takliflar: ${user.invitedCount}/${goal}`,
-                `Access: ${user.accessGranted ? 'ha' : 'yo‘q'}`,
-                `State: ${user.state}`,
-            ].join('\n');
-            await ctx.reply(text);
-        });
-
-        this.bot.command('messages', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            await this.showSupportList(ctx, 20);
-        });
-
-        this.bot.command('msguser', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            const idRaw = ctx.message?.text?.split(' ')[1];
-            const userId = Number(idRaw);
-            if (!Number.isInteger(userId)) {
-                await ctx.reply('Tarixni ko‘rish uchun user ID kiriting. Masalan: 5');
-                return;
-            }
-            await this.showSupportHistory(ctx, userId);
-        });
-
-        this.bot.command('msgreply', async (ctx) => {
-            if (!(await this.ensureAdmin(ctx))) return;
-            const idRaw = ctx.message?.text?.split(' ')[1];
-            const userId = Number(idRaw);
-            if (!Number.isInteger(userId)) {
-                await ctx.reply('Javob yozish uchun user ID kiriting. Masalan: 5');
-                return;
-            }
-            const user = await this.prisma.user.findUnique({ where: { id: userId } });
-            if (!user) {
-                await ctx.reply('User topilmadi.');
-                return;
-            }
-            const adminId = String(ctx.from?.id);
-            this.adminReplyTargets.set(adminId, userId);
-            await ctx.reply('Endi javob matnini yuboring.');
-        });
 
         // Reply keyboards for users/admins
         this.bot.hears('✅ A’zo bo‘ldim', async (ctx) => this.handleCheck(ctx));
@@ -768,11 +503,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
             const subscription = await this.checkRequiredChannels(user.telegramId);
             if (!subscription.ok) {
-                await this.sendRequiredSubscriptionPrompt(
-                    ctx,
-                    subscription.missingTelegram,
-                    subscription.externalLinks,
-                );
+                await this.sendRequiredSubscriptionPrompt(ctx, subscription.missingTelegram);
                 return;
             }
 
@@ -931,11 +662,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
         const required = await this.checkRequiredChannels(user.telegramId);
         if (!required.ok) {
-            await this.sendRequiredSubscriptionPrompt(
-                ctx,
-                required.missingTelegram,
-                required.externalLinks,
-            );
+            await this.sendRequiredSubscriptionPrompt(ctx, required.missingTelegram);
             return;
         }
 
@@ -1843,11 +1570,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
         const result = await this.checkRequiredChannels(user.telegramId);
         if (!result.ok) {
-            await this.sendRequiredSubscriptionPrompt(
-                ctx,
-                result.missingTelegram,
-                result.externalLinks,
-            );
+            await this.sendRequiredSubscriptionPrompt(ctx, result.missingTelegram);
             return;
         }
 
@@ -2305,58 +2028,30 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         if (result.ok) {
             return true;
         }
-        await this.sendRequiredSubscriptionPrompt(
-            ctx,
-            result.missingTelegram,
-            result.externalLinks,
-        );
+        await this.sendRequiredSubscriptionPrompt(ctx, result.missingTelegram);
         return false;
     }
 
     private async sendRequiredSubscriptionPrompt(
         ctx: Context,
         missingTelegramChannels: RequiredChannelInfo[],
-        externalChannels: RequiredChannelInfo[],
     ): Promise<void> {
         const keyboard = new InlineKeyboard();
-        let hasLink = false;
 
-        const visibleChannels = [...missingTelegramChannels, ...externalChannels];
-
-        for (const channel of visibleChannels) {
+        for (const channel of missingTelegramChannels) {
             const link = this.resolveChannelJoinLink(channel);
             if (link) {
-                hasLink = true;
-                keyboard.url(channel.isExternal ? '🌐 Havolani ochish' : '➕ Obuna bo‘lish', link);
+                keyboard.url('➕ Obuna bo‘lish', link);
                 keyboard.row();
             }
         }
 
         keyboard.text('✅ A’zo bo‘ldim', 'gate:check');
 
-        const telegramNames = missingTelegramChannels.map((channel, index) => {
-            const display = this.getRequiredChannelDisplayName(channel);
-            return `${index + 1}. ${display}`;
-        });
-
-        const externalNames = externalChannels.map((channel, index) => {
-            const display = this.getRequiredChannelDisplayName(channel);
-            return `${index + 1}. ${display}`;
-        });
-
         const lines = [
             'Botdan foydalanish uchun quyidagi barcha kanallarga obuna bo‘ling.',
             '',
-            'Tekshiriladigan Telegram kanallar:',
-            telegramNames.join('\n'),
-            '',
-            externalNames.length
-                ? ['Qo‘shimcha tashqi havolalar (tekshirilmaydi):', externalNames.join('\n')].join('\n')
-                : 'Qo‘shimcha tashqi havolalar: yo‘q',
-            '',
-            hasLink
-                ? 'Telegram kanallarga a’zo bo‘lgach, pastdagi "✅ A’zo bo‘ldim" tugmasini bosing.'
-                : 'Kanal linklari sozlanmagan. Iltimos, adminga murojaat qiling.',
+            'Telegram kanallarga a’zo bo‘lgach, pastdagi "✅ A’zo bo‘ldim" tugmasini bosing.',
         ];
 
         await ctx.reply(lines.join('\n'), { reply_markup: keyboard });

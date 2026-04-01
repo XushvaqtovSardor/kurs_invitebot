@@ -1585,9 +1585,14 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         const goal = await this.getReferralGoal();
         const link = this.buildReferralLink(user.referralCode);
         const messageText = await this.buildReferralMessageText(user, link, goal);
-        const inlineKeyboard = new InlineKeyboard().switchInline('♻️ Ulashish', 'referral');
+        const shareUrl = this.buildTelegramShareUrl(link, this.getDefaultReferralShareText());
+        const inlineKeyboard = new InlineKeyboard().url('♻️ Ulashish', shareUrl);
 
         const posterFileId = await this.getSetting(SETTING_REFERRAL_POSTER_FILE_ID);
+        if (posterFileId) {
+            inlineKeyboard.row().switchInline('🖼 Poster bilan ulashish', 'referral');
+        }
+
         if (posterFileId) {
             await ctx.replyWithPhoto(posterFileId, {
                 caption: this.fitCaptionWithLink(messageText, link),
@@ -1660,6 +1665,10 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             '',
             '👇 Quyidagi tugmani bosing va taklif qilishni boshlang',
         ].join('\n');
+    }
+
+    private getDefaultReferralShareText(): string {
+        return 'Siz kurslarni olish uchun botga taklif buyuring 👇';
     }
 
     private async buildReferralMessageText(user: User, link: string, goal: number): Promise<string> {

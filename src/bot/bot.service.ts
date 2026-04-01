@@ -44,6 +44,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     private readonly adminPendingActions = new Map<string, AdminPendingAction>();
     private readonly adminPaymentDrafts = new Map<string, { card: string; owner: string }>();
     private readonly adminRequiredDrafts = new Map<string, { chatId?: string; url?: string }>();
+    private readonly requiredGateConfirmedUsers = new Set<number>();
     private bot: Bot<Context> | null = null;
 
     constructor(
@@ -79,6 +80,10 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
         // User command
         this.bot.command('start', async (ctx) => this.handleStart(ctx));
+        this.bot.command('admin', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await this.showAdminPanel(ctx);
+        });
 
         // Reply keyboards for users/admins
         this.bot.hears('✅ A’zo bo‘ldim', async (ctx) => this.handleCheck(ctx));
@@ -503,7 +508,11 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
             const subscription = await this.checkRequiredChannels(user.telegramId);
             if (!subscription.ok) {
-                await this.sendRequiredSubscriptionPrompt(ctx, subscription.missingTelegram);
+                await this.sendRequiredSubscriptionPrompt(
+                    ctx,
+                    subscription.joinChannels,
+                    subscription.missingTelegram.length,
+                );
                 return;
             }
 
@@ -660,9 +669,17 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         const user = await this.getOrCreateUser(ctx.from, payload);
         await this.ensureAccessIfEligible(user.id);
 
+        // Every /start should re-open required links gate when external links exist.
+        this.requiredGateConfirmedUsers.delete(user.id);
         const required = await this.checkRequiredChannels(user.telegramId);
-        if (!required.ok) {
-            await this.sendRequiredSubscriptionPrompt(ctx, required.missingTelegram);
+        const needsExternalConfirmation =
+            required.externalLinks.length > 0 && !this.requiredGateConfirmedUsers.has(user.id);
+        if (!required.ok || needsExternalConfirmation) {
+            await this.sendRequiredSubscriptionPrompt(
+                ctx,
+                required.joinChannels,
+                required.missingTelegram.length,
+            );
             return;
         }
 
@@ -1570,8 +1587,16 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
         const result = await this.checkRequiredChannels(user.telegramId);
         if (!result.ok) {
-            await this.sendRequiredSubscriptionPrompt(ctx, result.missingTelegram);
+            await this.sendRequiredSubscriptionPrompt(
+                ctx,
+                result.joinChannels,
+                result.missingTelegram.length,
+            );
             return;
+        }
+
+        if (result.externalLinks.length > 0) {
+            this.requiredGateConfirmedUsers.add(user.id);
         }
 
         const hadAccess = user.accessGranted;
@@ -2025,22 +2050,28 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
     private async ensureUserSubscribedOrPrompt(ctx: Context, user: User): Promise<boolean> {
         const result = await this.checkRequiredChannels(user.telegramId);
-        if (result.ok) {
+        const needsExternalConfirmation =
+            result.externalLinks.length > 0 && !this.requiredGateConfirmedUsers.has(user.id);
+
+        if (result.ok && !needsExternalConfirmation) {
             return true;
         }
-        await this.sendRequiredSubscriptionPrompt(ctx, result.missingTelegram);
+        await this.sendRequiredSubscriptionPrompt(ctx, result.joinChannels, result.missingTelegram.length);
         return false;
     }
 
     private async sendRequiredSubscriptionPrompt(
         ctx: Context,
-        missingTelegramChannels: RequiredChannelInfo[],
+        joinChannels: RequiredChannelInfo[],
+        missingTelegramCount = 0,
     ): Promise<void> {
         const keyboard = new InlineKeyboard();
+        const usedLinks = new Set<string>();
 
-        for (const channel of missingTelegramChannels) {
+        for (const channel of joinChannels) {
             const link = this.resolveChannelJoinLink(channel);
-            if (link) {
+            if (link && !usedLinks.has(link)) {
+                usedLinks.add(link);
                 keyboard.url('➕ Obuna bo‘lish', link);
                 keyboard.row();
             }
@@ -2048,10 +2079,18 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
         keyboard.text('✅ A’zo bo‘ldim', 'gate:check');
 
+        const channelLines = joinChannels.length
+            ? joinChannels.map((channel, index) => `${index + 1}. ${this.getRequiredChannelDisplayName(channel)}`)
+            : ['Majburiy havola topilmadi, adminga murojaat qiling.'];
+
         const lines = [
-            'Botdan foydalanish uchun quyidagi barcha kanallarga obuna bo‘ling.',
+            'Botdan foydalanish uchun quyidagi majburiy havolalarga kiring.',
             '',
-            'Telegram kanallarga a’zo bo‘lgach, pastdagi "✅ A’zo bo‘ldim" tugmasini bosing.',
+            ...channelLines,
+            '',
+            missingTelegramCount > 0
+                ? 'Telegram kanallarga obuna bo‘lib qayting, so‘ng "✅ A’zo bo‘ldim" tugmasini bosing.'
+                : 'Havolalarga kirib bo‘lgach, pastdagi "✅ A’zo bo‘ldim" tugmasini bosing.',
         ];
 
         await ctx.reply(lines.join('\n'), { reply_markup: keyboard });
@@ -2146,17 +2185,19 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         ok: boolean;
         missingTelegram: RequiredChannelInfo[];
         externalLinks: RequiredChannelInfo[];
+        joinChannels: RequiredChannelInfo[];
     }> {
         const requiredChannels = await this.prisma.channel.findMany({
             where: { type: ChannelType.REQUIRED, isActive: true },
         });
 
         if (!requiredChannels.length) {
-            return { ok: true, missingTelegram: [], externalLinks: [] };
+            return { ok: true, missingTelegram: [], externalLinks: [], joinChannels: [] };
         }
 
         const missingTelegram: RequiredChannelInfo[] = [];
         const externalLinks: RequiredChannelInfo[] = [];
+        const joinChannels: RequiredChannelInfo[] = [];
 
         for (const channel of requiredChannels) {
             const info: RequiredChannelInfo = {
@@ -2166,6 +2207,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
                 username: channel.username,
                 isExternal: this.isExternalRequiredChannel(channel),
             };
+            joinChannels.push(info);
 
             if (info.isExternal) {
                 externalLinks.push(info);
@@ -2207,6 +2249,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             ok: missingTelegram.length === 0,
             missingTelegram,
             externalLinks,
+            joinChannels,
         };
     }
 

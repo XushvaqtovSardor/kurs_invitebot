@@ -17,6 +17,7 @@ const SETTING_PAYMENT_AMOUNT = 'payment_amount';
 const SETTING_PRIVATE_CHANNEL_LINK = 'private_channel_link';
 const SETTING_REFERRAL_POSTER_FILE_ID = 'referral_poster_file_id';
 const SETTING_REFERRAL_TEXT = 'referral_text';
+const SETTING_DYNAMIC_ADMIN_IDS = 'dynamic_admin_ids';
 
 type AdminPendingAction =
     | 'SET_PRIVATE_LINK'
@@ -27,6 +28,8 @@ type AdminPendingAction =
     | 'SET_PAYMENT_OWNER'
     | 'SET_PAYMENT_AMOUNT'
     | 'SET_REFERRAL_TEXT'
+    | 'ADD_ADMIN'
+    | 'PREPARE_BROADCAST_TEXT'
     | 'ADD_REQUIRED_TELEGRAM_CHAT'
     | 'ADD_REQUIRED_TELEGRAM_LINK'
     | 'ADD_REQUIRED_EXTERNAL_URL'
@@ -46,6 +49,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     private readonly adminPendingActions = new Map<string, AdminPendingAction>();
     private readonly adminPaymentDrafts = new Map<string, { card: string; owner: string }>();
     private readonly adminRequiredDrafts = new Map<string, { chatId?: string; url?: string }>();
+    private readonly adminBroadcastDrafts = new Map<string, { text: string }>();
+    private readonly dynamicAdminIds = new Set<number>();
     private readonly requiredJoinRequestMarks = new Map<string, Map<string, number>>();
     private readonly requiredJoinRequestTtlMs = 1000 * 60 * 60 * 24;
     private bot: Bot<Context> | null = null;
@@ -63,6 +68,11 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         }
 
         this.bot = new Bot<Context>(token);
+        try {
+            await this.loadDynamicAdminIds();
+        } catch (error) {
+            this.logger.warn(`Dynamic adminlar yuklanmadi: ${String(error)}`);
+        }
         this.registerHandlers();
 
         this.bot.catch((err) => {
@@ -96,6 +106,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         this.bot.hears('🔗 Referral link', async (ctx) => this.handleReferralRequest(ctx));
         this.bot.hears('Referal', async (ctx) => this.handleReferralRequest(ctx));
         this.bot.hears('👥 Mening takliflarim', async (ctx) => this.handleInvitesRequest(ctx));
+        this.bot.hears('🏆 Reting', async (ctx) => this.handleRatingRequest(ctx));
+        this.bot.hears('🏆 Reyting', async (ctx) => this.handleRatingRequest(ctx));
         this.bot.hears('🔒 Yopiq kanal linki', async (ctx) => this.handlePrivateLinkRequest(ctx));
         this.bot.hears('💳 To‘lov qilish', async (ctx) => this.handlePay(ctx));
         this.bot.hears('To‘lov', async (ctx) => this.handlePay(ctx));
@@ -167,6 +179,18 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         this.bot.hears('📌 Majburiy kanallar', async (ctx) => {
             if (!(await this.ensureAdmin(ctx))) return;
             await this.showRequiredChannelsManager(ctx);
+        });
+        this.bot.hears('📣 Reklama yuborish', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await this.promptPrepareBroadcast(ctx);
+        });
+        this.bot.hears('👮 Admin qo‘shish', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await this.promptAddAdmin(ctx);
+        });
+        this.bot.hears('👮‍♂️ Admin qo‘shish', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await this.promptAddAdmin(ctx);
         });
 
         this.bot.on('inline_query', async (ctx) => {
@@ -367,6 +391,22 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             if (!(await this.ensureAdmin(ctx))) return;
             await ctx.answerCallbackQuery();
             await this.showRequiredChannelsManager(ctx);
+        });
+
+        this.bot.callbackQuery('admin:broadcast_confirm', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await ctx.answerCallbackQuery();
+            await this.confirmBroadcast(ctx);
+        });
+
+        this.bot.callbackQuery('admin:broadcast_cancel', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await ctx.answerCallbackQuery();
+            const adminId = String(ctx.from?.id ?? '');
+            this.clearAdminSession(adminId);
+            await ctx.reply('Reklama yuborish bekor qilindi.', {
+                reply_markup: this.adminMenuKeyboard(),
+            });
         });
 
         this.bot.callbackQuery('admin:req:add_tg', async (ctx) => {
@@ -845,6 +885,80 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         });
     }
 
+    private async handleRatingRequest(ctx: Context): Promise<void> {
+        if (!ctx.from) return;
+
+        const user = await this.findUserByTelegramId(ctx.from.id);
+        if (!user) {
+            await ctx.reply('Iltimos, botni qayta ochib Start tugmasini bosing.');
+            return;
+        }
+
+        if (!(await this.ensureUserSubscribedOrPrompt(ctx, user))) {
+            return;
+        }
+
+        const [topUsers, betterCount] = await Promise.all([
+            this.prisma.user.findMany({
+                where: { invitedCount: { gt: 0 } },
+                orderBy: [{ invitedCount: 'desc' }, { createdAt: 'asc' }],
+                take: 20,
+            }),
+            this.prisma.user.count({
+                where: {
+                    OR: [
+                        { invitedCount: { gt: user.invitedCount } },
+                        {
+                            invitedCount: user.invitedCount,
+                            createdAt: { lt: user.createdAt },
+                        },
+                    ],
+                },
+            }),
+        ]);
+
+        if (!topUsers.length) {
+            await ctx.reply('Hozircha reyting bo‘sh.', {
+                reply_markup: this.userMenuKeyboard(),
+            });
+            return;
+        }
+
+        const lines = topUsers.map((topUser, index) => {
+            const displayName = topUser.username
+                ? `@${topUser.username}`
+                : topUser.firstName ?? topUser.telegramId;
+
+            if (index === 0) {
+                return `🥇 ${displayName} - ${topUser.invitedCount} ta`;
+            }
+
+            if (index === 1) {
+                return `🥈 ${displayName} - ${topUser.invitedCount} ta`;
+            }
+
+            if (index === 2) {
+                return `🥉 ${displayName} - ${topUser.invitedCount} ta`;
+            }
+
+            return `${index + 1}. ${displayName} - ${topUser.invitedCount} ta`;
+        });
+
+        await ctx.reply(
+            [
+                `🏆 Reting (Top ${topUsers.length})`,
+                '',
+                lines.join('\n'),
+                '',
+                `Sizning o‘rningiz: ${betterCount + 1}`,
+                `Takliflaringiz: ${user.invitedCount} ta`,
+            ].join('\n'),
+            {
+                reply_markup: this.userMenuKeyboard(),
+            },
+        );
+    }
+
     private async handlePrivateLinkRequest(ctx: Context): Promise<void> {
         if (!ctx.from) return;
 
@@ -967,6 +1081,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         this.adminPendingActions.delete(adminId);
         this.adminPaymentDrafts.delete(adminId);
         this.adminRequiredDrafts.delete(adminId);
+        this.adminBroadcastDrafts.delete(adminId);
     }
 
     private async showPrivateLinkManager(ctx: Context): Promise<void> {
@@ -1250,6 +1365,82 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         );
     }
 
+    private async promptPrepareBroadcast(ctx: Context): Promise<void> {
+        if (!ctx.from) return;
+        const adminId = String(ctx.from.id);
+        this.clearAdminSession(adminId);
+        this.adminPendingActions.set(adminId, 'PREPARE_BROADCAST_TEXT');
+        await ctx.reply('Barcha userlarga yuboriladigan reklama matnini yuboring.', {
+            reply_markup: this.cancelKeyboard(),
+        });
+    }
+
+    private async promptAddAdmin(ctx: Context): Promise<void> {
+        if (!ctx.from) return;
+        const adminId = String(ctx.from.id);
+        this.clearAdminSession(adminId);
+        this.adminPendingActions.set(adminId, 'ADD_ADMIN');
+        await ctx.reply(
+            [
+                'Yangi adminning Telegram ID yoki @username yuboring.',
+                'Masalan: 123456789 yoki @username',
+                'Username bo‘yicha qo‘shish uchun u foydalanuvchi avval botga /start bosgan bo‘lishi kerak.',
+            ].join('\n'),
+            { reply_markup: this.cancelKeyboard() },
+        );
+    }
+
+    private async confirmBroadcast(ctx: Context): Promise<void> {
+        if (!ctx.from || !this.bot) return;
+
+        const adminId = String(ctx.from.id);
+        const draft = this.adminBroadcastDrafts.get(adminId);
+        if (!draft) {
+            await ctx.reply('Yuborish uchun reklama matni topilmadi. Qaytadan urinib ko‘ring.', {
+                reply_markup: this.adminMenuKeyboard(),
+            });
+            return;
+        }
+
+        this.clearAdminSession(adminId);
+
+        const users = await this.prisma.user.findMany({
+            select: { telegramId: true },
+            orderBy: { createdAt: 'asc' },
+        });
+
+        if (!users.length) {
+            await ctx.reply('Yuborish uchun userlar topilmadi.', {
+                reply_markup: this.adminMenuKeyboard(),
+            });
+            return;
+        }
+
+        let sentCount = 0;
+        let failedCount = 0;
+
+        for (const user of users) {
+            try {
+                await this.bot.api.sendMessage(Number(user.telegramId), draft.text);
+                sentCount += 1;
+            } catch {
+                failedCount += 1;
+            }
+        }
+
+        await ctx.reply(
+            [
+                'Reklama yuborish yakunlandi.',
+                `Yuborildi: ${sentCount}`,
+                `Xatolik: ${failedCount}`,
+                `Jami user: ${users.length}`,
+            ].join('\n'),
+            {
+                reply_markup: this.adminMenuKeyboard(),
+            },
+        );
+    }
+
     private async handleAdminPendingText(
         ctx: Context,
         text: string,
@@ -1263,6 +1454,32 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         if (text.toLowerCase() === 'bekor qilish') {
             this.clearAdminSession(adminId);
             await ctx.reply('Amal bekor qilindi.', { reply_markup: this.adminMenuKeyboard() });
+            return true;
+        }
+
+        if (action === 'ADD_ADMIN') {
+            const resolved = await this.resolveAdminCandidateToTelegramId(text);
+            if (!resolved.ok) {
+                await ctx.reply(resolved.message);
+                return true;
+            }
+
+            const nextAdminId = resolved.telegramId;
+            if (this.getAdminIds().includes(nextAdminId)) {
+                this.clearAdminSession(adminId);
+                await ctx.reply(`Bu foydalanuvchi allaqachon admin: ${nextAdminId}`, {
+                    reply_markup: this.adminMenuKeyboard(),
+                });
+                return true;
+            }
+
+            this.dynamicAdminIds.add(nextAdminId);
+            await this.saveDynamicAdminIds();
+            this.clearAdminSession(adminId);
+
+            await ctx.reply(`Yangi admin qo‘shildi: ${nextAdminId}`, {
+                reply_markup: this.adminMenuKeyboard(),
+            });
             return true;
         }
 
@@ -1516,12 +1733,39 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             return true;
         }
 
+        if (action === 'PREPARE_BROADCAST_TEXT') {
+            const nextText = text.trim();
+            if (!nextText) {
+                await ctx.reply('Reklama matni bo‘sh bo‘lmasin. Iltimos, qayta yuboring.');
+                return true;
+            }
+
+            this.adminPendingActions.delete(adminId);
+            this.adminBroadcastDrafts.set(adminId, { text: nextText });
+
+            const preview = nextText.length > 700 ? `${nextText.slice(0, 700)}...` : nextText;
+
+            await ctx.reply(
+                [
+                    'Quyidagi xabar barcha userlarga yuborilsinmi?',
+                    '',
+                    preview,
+                ].join('\n'),
+                {
+                    reply_markup: new InlineKeyboard()
+                        .text('✅ Ha', 'admin:broadcast_confirm')
+                        .text('❌ Yo‘q', 'admin:broadcast_cancel'),
+                },
+            );
+            return true;
+        }
+
         return false;
     }
 
     private userMenuKeyboard(): Keyboard {
         return new Keyboard([
-            ['📊 Mening statistikam', '🔗 Referral link'],
+            ['🏆 Reting', '🔗 Referral link'],
             ['👥 Mening takliflarim', '🔒 Yopiq kanal linki'],
             ['💳 To‘lov qilish', '💬 Qo‘llab-quvvatlash'],
         ]).resized();
@@ -1535,6 +1779,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         return new Keyboard([
             ['📊 Statistika', '👥 Foydalanuvchilar'],
             ['🧾 To‘lovlar', '💬 Xabarlar'],
+            ['👮 Admin qo‘shish', '📣 Reklama yuborish'],
             ['🔐 Linkni o‘rnatish', '🗂 Database kanal'],
             ['💳 To‘lov sozlash', '🖼 Referral posteri'],
             ['📝 Referral matni'],
@@ -1589,9 +1834,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         const inlineKeyboard = new InlineKeyboard().url('♻️ Ulashish', shareUrl);
 
         const posterFileId = await this.getSetting(SETTING_REFERRAL_POSTER_FILE_ID);
-        if (posterFileId) {
-            inlineKeyboard.row().switchInline('🖼 Poster bilan ulashish', 'referral');
-        }
 
         if (posterFileId) {
             await ctx.replyWithPhoto(posterFileId, {
@@ -2803,12 +3045,89 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         }
     }
 
-    private getAdminIds(): number[] {
-        const raw = this.configService.get<string>('ADMIN_IDS') ?? '';
+    private async loadDynamicAdminIds(): Promise<void> {
+        const raw = (await this.getSetting(SETTING_DYNAMIC_ADMIN_IDS)) ?? '';
+        this.dynamicAdminIds.clear();
+        this.parseAdminIds(raw).forEach((id) => this.dynamicAdminIds.add(id));
+    }
+
+    private async saveDynamicAdminIds(): Promise<void> {
+        const ids = [...this.dynamicAdminIds]
+            .filter((id) => Number.isInteger(id) && id > 0)
+            .sort((a, b) => a - b);
+
+        if (!ids.length) {
+            await this.deleteSetting(SETTING_DYNAMIC_ADMIN_IDS);
+            return;
+        }
+
+        await this.setSetting(SETTING_DYNAMIC_ADMIN_IDS, ids.join(','));
+    }
+
+    private parseAdminIds(raw: string): number[] {
         return raw
             .split(',')
             .map((item) => Number(item.trim()))
             .filter((item) => Number.isFinite(item) && item > 0);
+    }
+
+    private async resolveAdminCandidateToTelegramId(
+        value: string,
+    ): Promise<{ ok: true; telegramId: number } | { ok: false; message: string }> {
+        const trimmed = value.trim();
+        if (!trimmed) {
+            return {
+                ok: false,
+                message: 'Qiymat bo‘sh. Telegram ID yoki @username yuboring.',
+            };
+        }
+
+        if (/^\d+$/.test(trimmed)) {
+            const parsed = Number(trimmed);
+            if (!Number.isInteger(parsed) || parsed <= 0) {
+                return { ok: false, message: 'Telegram ID noto‘g‘ri.' };
+            }
+            return { ok: true, telegramId: parsed };
+        }
+
+        const username = trimmed.replace(/^@/, '');
+        if (!/^[A-Za-z0-9_]{5,}$/.test(username)) {
+            return {
+                ok: false,
+                message: 'Username noto‘g‘ri. Namuna: @username yoki 123456789',
+            };
+        }
+
+        const user = await this.prisma.user.findFirst({
+            where: {
+                username: {
+                    equals: username,
+                    mode: 'insensitive',
+                },
+            },
+        });
+
+        if (!user) {
+            return {
+                ok: false,
+                message:
+                    'Bu username bilan user topilmadi. User avval botga /start bosgan bo‘lishi kerak.',
+            };
+        }
+
+        const parsed = Number(user.telegramId);
+        if (!Number.isInteger(parsed) || parsed <= 0) {
+            return { ok: false, message: 'Topilgan user Telegram ID si noto‘g‘ri ko‘rinishda.' };
+        }
+
+        return { ok: true, telegramId: parsed };
+    }
+
+    private getAdminIds(): number[] {
+        const envIds = this.parseAdminIds(this.configService.get<string>('ADMIN_IDS') ?? '');
+        const merged = new Set<number>(envIds);
+        this.dynamicAdminIds.forEach((id) => merged.add(id));
+        return [...merged];
     }
 
     private isAdmin(telegramId: number): boolean {

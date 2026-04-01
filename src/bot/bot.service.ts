@@ -1590,7 +1590,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         const posterFileId = await this.getSetting(SETTING_REFERRAL_POSTER_FILE_ID);
         if (posterFileId) {
             await ctx.replyWithPhoto(posterFileId, {
-                caption: this.fitCaption(messageText),
+                caption: this.fitCaptionWithLink(messageText, link),
                 reply_markup: inlineKeyboard,
             });
             return;
@@ -1666,18 +1666,41 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         const remaining = Math.max(goal - user.invitedCount, 0);
         const template = (await this.getSetting(SETTING_REFERRAL_TEXT)) ?? this.getDefaultReferralTemplate();
 
-        return template
+        const rendered = template
             .replace(/\{link\}/gi, link)
             .replace(/\{invited\}/gi, String(user.invitedCount))
             .replace(/\{goal\}/gi, String(goal))
             .replace(/\{remaining\}/gi, String(remaining));
+
+        return this.ensureReferralLinkInText(rendered, link);
     }
 
-    private fitCaption(text: string): string {
-        if (text.length <= 1024) {
+    private ensureReferralLinkInText(text: string, link: string): string {
+        if (text.includes(link)) {
             return text;
         }
-        return `${text.slice(0, 1021)}...`;
+
+        const trimmed = text.trim();
+        if (!trimmed) {
+            return link;
+        }
+
+        return `${trimmed}\n\n${link}`;
+    }
+
+    private fitCaptionWithLink(text: string, link: string): string {
+        const fullText = this.ensureReferralLinkInText(text, link);
+        if (fullText.length <= 1024) {
+            return fullText;
+        }
+
+        const suffix = `\n\n${link}`;
+        const maxBody = 1024 - suffix.length - 3;
+        if (maxBody <= 0) {
+            return `${fullText.slice(0, 1021)}...`;
+        }
+
+        return `${fullText.slice(0, maxBody)}...${suffix}`;
     }
 
     private async handleInlineReferralShare(ctx: Context): Promise<void> {
@@ -1715,19 +1738,20 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         const link = this.buildReferralLink(user.referralCode);
         const messageText = await this.buildReferralMessageText(user, link, goal);
         const posterFileId = await this.getSetting(SETTING_REFERRAL_POSTER_FILE_ID);
+        const resultSuffix = `${user.id}-${Date.now()}`;
 
         if (posterFileId) {
             // @grammyjs/types in this project does not include cached_* inline variants.
             const cachedPhotoResult = {
                 type: 'cached_photo',
-                id: `ref-photo-${user.id}`,
+                id: `ref-photo-${resultSuffix}`,
                 photo_file_id: posterFileId,
-                caption: this.fitCaption(messageText),
+                caption: this.fitCaptionWithLink(messageText, link),
             } as any;
 
             await ctx.answerInlineQuery(
                 [cachedPhotoResult],
-                { cache_time: 5, is_personal: true },
+                { cache_time: 0, is_personal: true },
             );
             return;
         }
@@ -1736,7 +1760,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             [
                 {
                     type: 'article',
-                    id: `ref-article-${user.id}`,
+                    id: `ref-article-${resultSuffix}`,
                     title: 'Referral postini ulashish',
                     description: 'Matn va havola bilan yuborish',
                     input_message_content: {
@@ -1744,7 +1768,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
                     },
                 },
             ],
-            { cache_time: 5, is_personal: true },
+            { cache_time: 0, is_personal: true },
         );
     }
 

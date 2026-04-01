@@ -16,6 +16,7 @@ const SETTING_PAYMENT_CARD_OWNER = 'payment_card_owner';
 const SETTING_PAYMENT_AMOUNT = 'payment_amount';
 const SETTING_PRIVATE_CHANNEL_LINK = 'private_channel_link';
 const SETTING_REFERRAL_POSTER_FILE_ID = 'referral_poster_file_id';
+const SETTING_REFERRAL_TEXT = 'referral_text';
 
 type AdminPendingAction =
     | 'SET_PRIVATE_LINK'
@@ -25,6 +26,7 @@ type AdminPendingAction =
     | 'SET_PAYMENT_CARD'
     | 'SET_PAYMENT_OWNER'
     | 'SET_PAYMENT_AMOUNT'
+    | 'SET_REFERRAL_TEXT'
     | 'ADD_REQUIRED_TELEGRAM_CHAT'
     | 'ADD_REQUIRED_TELEGRAM_LINK'
     | 'ADD_REQUIRED_EXTERNAL_URL'
@@ -44,7 +46,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     private readonly adminPendingActions = new Map<string, AdminPendingAction>();
     private readonly adminPaymentDrafts = new Map<string, { card: string; owner: string }>();
     private readonly adminRequiredDrafts = new Map<string, { chatId?: string; url?: string }>();
-    private readonly requiredGateConfirmedUsers = new Set<number>();
+    private readonly requiredJoinRequestMarks = new Map<string, Map<string, number>>();
+    private readonly requiredJoinRequestTtlMs = 1000 * 60 * 60 * 24;
     private bot: Bot<Context> | null = null;
 
     constructor(
@@ -149,9 +152,25 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             if (!(await this.ensureAdmin(ctx))) return;
             await this.showReferralPosterManager(ctx);
         });
+        this.bot.hears('📝 Referral matni', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await this.showReferralTextManager(ctx);
+        });
+        this.bot.hears('Referral matni', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await this.showReferralTextManager(ctx);
+        });
+        this.bot.hears('Refral matni', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await this.showReferralTextManager(ctx);
+        });
         this.bot.hears('📌 Majburiy kanallar', async (ctx) => {
             if (!(await this.ensureAdmin(ctx))) return;
             await this.showRequiredChannelsManager(ctx);
+        });
+
+        this.bot.on('inline_query', async (ctx) => {
+            await this.handleInlineReferralShare(ctx);
         });
 
         // Inline keyboards
@@ -321,6 +340,27 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             this.clearAdminSession(String(ctx.from?.id ?? ''));
             await ctx.reply('Referral posteri o‘chirildi.');
             await this.showReferralPosterManager(ctx);
+        });
+
+        this.bot.callbackQuery('admin:set_ref_text', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await ctx.answerCallbackQuery();
+            await this.promptSetReferralText(ctx);
+        });
+
+        this.bot.callbackQuery('admin:manage_ref_text', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await ctx.answerCallbackQuery();
+            await this.showReferralTextManager(ctx);
+        });
+
+        this.bot.callbackQuery('admin:delete_ref_text', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await ctx.answerCallbackQuery();
+            await this.deleteSetting(SETTING_REFERRAL_TEXT);
+            this.clearAdminSession(String(ctx.from?.id ?? ''));
+            await ctx.reply('Referral matni default holatga qaytarildi.');
+            await this.showReferralTextManager(ctx);
         });
 
         this.bot.callbackQuery('admin:manage_required', async (ctx) => {
@@ -506,13 +546,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             const user = await this.findUserByTelegramId(ctx.from.id);
             if (!user || user.state !== UserState.AWAITING_RECEIPT) return;
 
-            const subscription = await this.checkRequiredChannels(user.telegramId);
-            if (!subscription.ok) {
-                await this.sendRequiredSubscriptionPrompt(
-                    ctx,
-                    subscription.joinChannels,
-                    subscription.missingTelegram.length,
-                );
+            if (!(await this.ensureUserSubscribedOrPrompt(ctx, user))) {
                 return;
             }
 
@@ -596,6 +630,10 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             if (!user) return;
 
             if (user.state === UserState.AWAITING_SUPPORT_MESSAGE) {
+                if (!(await this.ensureUserSubscribedOrPrompt(ctx, user))) {
+                    return;
+                }
+
                 if (!text) {
                     await ctx.reply('Iltimos, matn yuboring.');
                     return;
@@ -620,37 +658,62 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             }
         });
 
-        // Auto-approve join requests only for users who received a private link from the bot
+        // Required channels: mark join-requests as pending-completed. Private channel: strict grant-based auto-approve.
         this.bot.on('chat_join_request', async (ctx) => {
-            const privateChannel = await this.prisma.channel.findFirst({
-                where: { type: ChannelType.PRIVATE_ACCESS, isActive: true },
+            const channelTelegramId = String(ctx.chatJoinRequest.chat.id);
+            const trackedChannel = await this.prisma.channel.findFirst({
+                where: {
+                    telegramId: channelTelegramId,
+                    isActive: true,
+                    type: { in: [ChannelType.REQUIRED, ChannelType.PRIVATE_ACCESS] },
+                },
             });
-            if (!privateChannel) return;
-            if (String(ctx.chatJoinRequest.chat.id) !== privateChannel.telegramId) return;
+            if (!trackedChannel) return;
 
             const telegramId = String(ctx.chatJoinRequest.from.id);
+
+            if (trackedChannel.type === ChannelType.REQUIRED) {
+                this.markRequiredJoinRequest(telegramId, trackedChannel.telegramId);
+                return;
+            }
+
             const user = await this.prisma.user.findUnique({ where: { telegramId } });
+            const chatId = Number(trackedChannel.telegramId);
+            const fromId = Number(telegramId);
+
+            const denyRequest = async (notifyText: string): Promise<void> => {
+                try {
+                    await ctx.api.declineChatJoinRequest(chatId, fromId);
+                } catch (error) {
+                    this.logger.warn(`Join request rad etilmadi: ${String(error)}`);
+                }
+                await this.notifyUser(telegramId, notifyText);
+            };
 
             if (!user) {
-                // Unknown users stay pending so admins can review manually.
+                await denyRequest(
+                    'So‘rov rad etildi. Avval bot orqali ruxsat oling: 5 ta taklif yoki tasdiqlangan to‘lovdan keyin bot sizga maxsus link yuboradi.',
+                );
                 return;
             }
 
             const grant = await this.prisma.privateAccessGrant.findFirst({
                 where: {
                     userId: user.id,
-                    channelTelegramId: privateChannel.telegramId,
+                    channelTelegramId: trackedChannel.telegramId,
                     isActive: true,
                     approvedAt: null,
                 },
                 orderBy: { createdAt: 'desc' },
             });
             if (!grant) {
-                // Bot sent no private link to this user, keep request pending for manual admin decision.
+                await denyRequest(
+                    'So‘rov rad etildi. Sizga bot tomonidan hali ruxsat linki yuborilmagan.',
+                );
                 return;
             }
 
-            await ctx.api.approveChatJoinRequest(Number(privateChannel.telegramId), Number(telegramId));
+            await ctx.api.approveChatJoinRequest(chatId, fromId);
             await this.prisma.privateAccessGrant.update({
                 where: { id: grant.id },
                 data: {
@@ -669,17 +732,10 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         const user = await this.getOrCreateUser(ctx.from, payload);
         await this.ensureAccessIfEligible(user.id);
 
-        // Every /start should re-open required links gate when external links exist.
-        this.requiredGateConfirmedUsers.delete(user.id);
         const required = await this.checkRequiredChannels(user.telegramId);
-        const needsExternalConfirmation =
-            required.externalLinks.length > 0 && !this.requiredGateConfirmedUsers.has(user.id);
-        if (!required.ok || needsExternalConfirmation) {
-            await this.sendRequiredSubscriptionPrompt(
-                ctx,
-                required.joinChannels,
-                required.missingTelegram.length,
-            );
+        const pendingChannels = this.getPendingRequiredPromptChannels(required);
+        if (pendingChannels.length > 0) {
+            await this.sendRequiredSubscriptionPrompt(ctx, pendingChannels);
             return;
         }
 
@@ -918,12 +974,17 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         const privateChannel = await this.prisma.channel.findFirst({
             where: { type: ChannelType.PRIVATE_ACCESS, isActive: true },
         });
+        const botAdmin = privateChannel
+            ? await this.isBotAdminInChannel(privateChannel.telegramId)
+            : false;
 
         await ctx.reply(
             [
-                'Yopiq kanal linki boshqaruvi:',
-                `Joriy link: ${privateLink ?? 'o‘rnatilmagan'}`,
+                'Yopiq kanal boshqaruvi:',
                 `Private kanal ID: ${privateChannel?.telegramId ?? 'o‘rnatilmagan'}`,
+                `Kanal linki: ${privateLink ?? 'o‘rnatilmagan'}`,
+                `Bot adminligi: ${botAdmin ? 'tasdiqlangan ✅' : 'tasdiqlanmagan ❌'}`,
+                'Kirish usuli: so‘rov asosida (bot har user uchun alohida link yaratadi).',
                 '',
                 'Qaysi amalni bajarasiz?',
             ].join('\n'),
@@ -931,11 +992,13 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
                 reply_markup: new InlineKeyboard()
                     .text('🔐 Kanal ID ni yangilash', 'admin:set_private_channel')
                     .row()
-                    .text('🗑 Kanal ID ni o‘chirish', 'admin:delete_private_channel')
-                    .row()
                     .text('✏️ Linkni yangilash', 'admin:set_private_link')
                     .row()
-                    .text('🗑 Linkni o‘chirish', 'admin:delete_private_link'),
+                    .text('🗑 Linkni o‘chirish', 'admin:delete_private_link')
+                    .row()
+                    .text('🗑 Kanal ID ni o‘chirish', 'admin:delete_private_channel')
+                    .row()
+                    .text('🔄 Yangilash', 'admin:manage_private'),
             },
         );
     }
@@ -999,6 +1062,32 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
                     .text('✏️ Poster yuklash', 'admin:set_ref_poster')
                     .row()
                     .text('🗑 Posterni o‘chirish', 'admin:delete_ref_poster'),
+            },
+        );
+    }
+
+    private async showReferralTextManager(ctx: Context): Promise<void> {
+        const referralText = await this.getSetting(SETTING_REFERRAL_TEXT);
+        const preview = referralText
+            ? referralText.slice(0, 500)
+            : this.getDefaultReferralTemplate();
+
+        await ctx.reply(
+            [
+                'Referral matni boshqaruvi:',
+                `Holat: ${referralText ? 'custom' : 'default'}`,
+                '',
+                'Mavjud matn preview:',
+                preview,
+                '',
+                'Placeholder: {link}',
+                'Qaysi amalni bajarasiz?',
+            ].join('\n'),
+            {
+                reply_markup: new InlineKeyboard()
+                    .text('✏️ Matnni yangilash', 'admin:set_ref_text')
+                    .row()
+                    .text('🗑 Defaultga qaytarish', 'admin:delete_ref_text'),
             },
         );
     }
@@ -1113,7 +1202,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         this.clearAdminSession(String(ctx.from.id));
         this.adminPendingActions.set(String(ctx.from.id), 'SET_PRIVATE_CHANNEL_ID');
         await ctx.reply(
-            'Private kanal ID ni yuboring.\nNamuna: -1001234567890\nKanal ID ni @userinfobot yordamida olishingiz mumkin.\nBot shu kanalda admin bo‘lishi shart.',
+            'Private kanal ID ni yuboring.\nNamuna: -1001234567890\nKanal ID ni @userinfobot yordamida olishingiz mumkin.\nBot shu kanalda admin bo‘lishi shart.\nID saqlangach, kanal linki ham so‘raladi.',
             { reply_markup: this.cancelKeyboard() },
         );
     }
@@ -1145,6 +1234,20 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         await ctx.reply('Referral uchun posterni rasm ko‘rinishida yuboring (photo).', {
             reply_markup: this.cancelKeyboard(),
         });
+    }
+
+    private async promptSetReferralText(ctx: Context): Promise<void> {
+        if (!ctx.from) return;
+        this.clearAdminSession(String(ctx.from.id));
+        this.adminPendingActions.set(String(ctx.from.id), 'SET_REFERRAL_TEXT');
+        await ctx.reply(
+            [
+                'Referral matnini yuboring.',
+                'Placeholder: {link}',
+                'Masalan: "Do‘stlaringizni taklif qiling. Havola: {link}"',
+            ].join('\n'),
+            { reply_markup: this.cancelKeyboard() },
+        );
     }
 
     private async handleAdminPendingText(
@@ -1264,6 +1367,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             await ctx.reply('Yopiq kanal linki saqlandi.', {
                 reply_markup: this.adminMenuKeyboard(),
             });
+            await this.showPrivateLinkManager(ctx);
             return true;
         }
 
@@ -1287,11 +1391,11 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
                 });
 
                 this.clearAdminSession(adminId);
+                this.adminPendingActions.set(adminId, 'SET_PRIVATE_LINK');
                 await ctx.reply(
-                    'Private kanal ID saqlandi. Bot adminligi tasdiqlandi.',
-                    { reply_markup: this.adminMenuKeyboard() },
+                    'Private kanal ID saqlandi. Bot adminligi tasdiqlandi.\nEndi shu kanalning linkini yuboring (@username yoki https://t.me/...).',
+                    { reply_markup: this.cancelKeyboard() },
                 );
-                await this.showPrivateLinkManager(ctx);
             } catch (error) {
                 const message =
                     error instanceof Error ? error.message : 'Private kanalni saqlab bo‘lmadi.';
@@ -1396,6 +1500,22 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             return true;
         }
 
+        if (action === 'SET_REFERRAL_TEXT') {
+            const nextText = text.trim();
+            if (!nextText) {
+                await ctx.reply('Matn bo‘sh bo‘lmasin. Iltimos, qayta yuboring.');
+                return true;
+            }
+
+            await this.setSetting(SETTING_REFERRAL_TEXT, nextText);
+            this.clearAdminSession(adminId);
+            await ctx.reply('Referral matni saqlandi.', {
+                reply_markup: this.adminMenuKeyboard(),
+            });
+            await this.showReferralTextManager(ctx);
+            return true;
+        }
+
         return false;
     }
 
@@ -1417,6 +1537,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             ['🧾 To‘lovlar', '💬 Xabarlar'],
             ['🔐 Linkni o‘rnatish', '🗂 Database kanal'],
             ['💳 To‘lov sozlash', '🖼 Referral posteri'],
+            ['📝 Referral matni'],
             ['📌 Majburiy kanallar'],
         ]).resized();
     }
@@ -1441,7 +1562,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         const lines = [
             withGreeting ? `Assalomu alaykum, ${name}!` : 'Sizning statistikangiz:',
             '',
-            `ID: ${user.telegramId}`,
             `Taklif qilganlar: ${user.invitedCount}/${goal}`,
             `Yetishmayotgan takliflar: ${remaining}`,
             `To‘lov holati: ${paymentText}`,
@@ -1464,28 +1584,13 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     private async sendReferralInfo(ctx: Context, user: User): Promise<void> {
         const goal = await this.getReferralGoal();
         const link = this.buildReferralLink(user.referralCode);
-
-        const remaining = Math.max(goal - user.invitedCount, 0);
-        const messageText = [
-            'Sizning referral linkingiz:',
-            link,
-            '',
-            `Takliflar: ${user.invitedCount}/${goal}`,
-            `Yetishmayotgan: ${remaining}`,
-            '',
-            'Yangi foydalanuvchi majburiy kanallarga a’zo bo‘lsa, taklif hisoblanadi.',
-        ].join('\n');
-
-        const shareUrl = this.buildTelegramShareUrl(
-            link,
-            "Yopiq kanalga kirish uchun shu link orqali botga kiring:",
-        );
-        const inlineKeyboard = new InlineKeyboard().url('♻️ Ulashish', shareUrl);
+        const messageText = await this.buildReferralMessageText(user, link, goal);
+        const inlineKeyboard = new InlineKeyboard().switchInline('♻️ Ulashish', 'referral');
 
         const posterFileId = await this.getSetting(SETTING_REFERRAL_POSTER_FILE_ID);
         if (posterFileId) {
             await ctx.replyWithPhoto(posterFileId, {
-                caption: messageText,
+                caption: this.fitCaption(messageText),
                 reply_markup: inlineKeyboard,
             });
             return;
@@ -1532,6 +1637,115 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     private buildTelegramShareUrl(url: string, text: string): string {
         const params = new URLSearchParams({ url, text });
         return `https://t.me/share/url?${params.toString()}`;
+    }
+
+    private getDefaultReferralTemplate(): string {
+        return [
+            '🧪 KIMYO fanidan BEPUL TEZKOR DTM kursiga start berildi!',
+            '',
+            '🗓 Kurs boshlanish sanasi: 10-aprel',
+            '📚 Darslar har kuni Telegram orqali olib boriladi.',
+            '',
+            'Asosiy kanal: @Prime_kimyo',
+            '',
+            '🔥 Darslar mutlaqo BEPUL!',
+            '',
+            'Lekin kursimiz ko‘proq abituriyentlarga yetib borishi uchun sizning yordamingiz kerak bo‘ladi 👇',
+            '',
+            '🤖 Bot sizga maxsus havola beradi.',
+            '{link}',
+            'Siz esa shu havola orqali 5 ta do‘stingizni taklif qilasiz — va bot sizga avtomatik tarzda kursga kirish imkonini beradi!',
+            '',
+            '🚀 Hoziroq boshlang va natijaga erishing!',
+            '',
+            '👇 Quyidagi tugmani bosing va taklif qilishni boshlang',
+        ].join('\n');
+    }
+
+    private async buildReferralMessageText(user: User, link: string, goal: number): Promise<string> {
+        const remaining = Math.max(goal - user.invitedCount, 0);
+        const template = (await this.getSetting(SETTING_REFERRAL_TEXT)) ?? this.getDefaultReferralTemplate();
+
+        return template
+            .replace(/\{link\}/gi, link)
+            .replace(/\{invited\}/gi, String(user.invitedCount))
+            .replace(/\{goal\}/gi, String(goal))
+            .replace(/\{remaining\}/gi, String(remaining));
+    }
+
+    private fitCaption(text: string): string {
+        if (text.length <= 1024) {
+            return text;
+        }
+        return `${text.slice(0, 1021)}...`;
+    }
+
+    private async handleInlineReferralShare(ctx: Context): Promise<void> {
+        if (!ctx.from || !ctx.inlineQuery) {
+            return;
+        }
+
+        const user = await this.findUserByTelegramId(ctx.from.id);
+        if (!user) {
+            await ctx.answerInlineQuery([], { cache_time: 5, is_personal: true });
+            return;
+        }
+
+        const required = await this.checkRequiredChannels(user.telegramId);
+        if (!required.ok) {
+            await ctx.answerInlineQuery(
+                [
+                    {
+                        type: 'article',
+                        id: `required-${user.id}`,
+                        title: 'Avval majburiy kanallarga obuna bo‘ling',
+                        description: 'Botga qaytib "✅ A’zo bo‘ldim" tugmasini bosing.',
+                        input_message_content: {
+                            message_text:
+                                'Avval botga qayting va majburiy havolalarga obuna bo‘lib, "✅ A’zo bo‘ldim" tugmasini bosing.',
+                        },
+                    },
+                ],
+                { cache_time: 5, is_personal: true },
+            );
+            return;
+        }
+
+        const goal = await this.getReferralGoal();
+        const link = this.buildReferralLink(user.referralCode);
+        const messageText = await this.buildReferralMessageText(user, link, goal);
+        const posterFileId = await this.getSetting(SETTING_REFERRAL_POSTER_FILE_ID);
+
+        if (posterFileId) {
+            // @grammyjs/types in this project does not include cached_* inline variants.
+            const cachedPhotoResult = {
+                type: 'cached_photo',
+                id: `ref-photo-${user.id}`,
+                photo_file_id: posterFileId,
+                caption: this.fitCaption(messageText),
+            } as any;
+
+            await ctx.answerInlineQuery(
+                [cachedPhotoResult],
+                { cache_time: 5, is_personal: true },
+            );
+            return;
+        }
+
+        await ctx.answerInlineQuery(
+            [
+                {
+                    type: 'article',
+                    id: `ref-article-${user.id}`,
+                    title: 'Referral postini ulashish',
+                    description: 'Matn va havola bilan yuborish',
+                    input_message_content: {
+                        message_text: messageText,
+                    },
+                },
+            ],
+            { cache_time: 5, is_personal: true },
+        );
     }
 
     private async getOrCreateUser(tgUser: Context['from'], payload?: string): Promise<User> {
@@ -1586,17 +1800,10 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         }
 
         const result = await this.checkRequiredChannels(user.telegramId);
-        if (!result.ok) {
-            await this.sendRequiredSubscriptionPrompt(
-                ctx,
-                result.joinChannels,
-                result.missingTelegram.length,
-            );
+        const pendingChannels = this.getPendingRequiredPromptChannels(result);
+        if (pendingChannels.length > 0) {
+            await this.sendRequiredSubscriptionPrompt(ctx, pendingChannels);
             return;
-        }
-
-        if (result.externalLinks.length > 0) {
-            this.requiredGateConfirmedUsers.add(user.id);
         }
 
         const hadAccess = user.accessGranted;
@@ -2050,20 +2257,32 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
     private async ensureUserSubscribedOrPrompt(ctx: Context, user: User): Promise<boolean> {
         const result = await this.checkRequiredChannels(user.telegramId);
-        const needsExternalConfirmation =
-            result.externalLinks.length > 0 && !this.requiredGateConfirmedUsers.has(user.id);
+        const pendingChannels = this.getPendingRequiredPromptChannels(result);
 
-        if (result.ok && !needsExternalConfirmation) {
+        if (pendingChannels.length === 0) {
             return true;
         }
-        await this.sendRequiredSubscriptionPrompt(ctx, result.joinChannels, result.missingTelegram.length);
+        await this.sendRequiredSubscriptionPrompt(ctx, pendingChannels);
         return false;
+    }
+
+    private getPendingRequiredPromptChannels(
+        result: {
+            missingTelegram: RequiredChannelInfo[];
+            externalLinks: RequiredChannelInfo[];
+        },
+    ): RequiredChannelInfo[] {
+        if (result.missingTelegram.length === 0) {
+            return [];
+        }
+
+        // External links are shown together with missing Telegram channels, but never verified.
+        return [...result.missingTelegram, ...result.externalLinks];
     }
 
     private async sendRequiredSubscriptionPrompt(
         ctx: Context,
         joinChannels: RequiredChannelInfo[],
-        missingTelegramCount = 0,
     ): Promise<void> {
         const keyboard = new InlineKeyboard();
         const usedLinks = new Set<string>();
@@ -2079,21 +2298,56 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
         keyboard.text('✅ A’zo bo‘ldim', 'gate:check');
 
-        const channelLines = joinChannels.length
-            ? joinChannels.map((channel, index) => `${index + 1}. ${this.getRequiredChannelDisplayName(channel)}`)
-            : ['Majburiy havola topilmadi, adminga murojaat qiling.'];
-
         const lines = [
             'Botdan foydalanish uchun quyidagi majburiy havolalarga kiring.',
             '',
-            ...channelLines,
-            '',
-            missingTelegramCount > 0
-                ? 'Telegram kanallarga obuna bo‘lib qayting, so‘ng "✅ A’zo bo‘ldim" tugmasini bosing.'
-                : 'Havolalarga kirib bo‘lgach, pastdagi "✅ A’zo bo‘ldim" tugmasini bosing.',
+            'Telegram kanallarga obuna bo‘lib qayting, so‘ng "✅ A’zo bo‘ldim" tugmasini bosing.',
         ];
 
         await ctx.reply(lines.join('\n'), { reply_markup: keyboard });
+    }
+
+    private markRequiredJoinRequest(userTelegramId: string, channelTelegramId: string): void {
+        let channelMap = this.requiredJoinRequestMarks.get(userTelegramId);
+        if (!channelMap) {
+            channelMap = new Map<string, number>();
+            this.requiredJoinRequestMarks.set(userTelegramId, channelMap);
+        }
+        channelMap.set(channelTelegramId, Date.now());
+    }
+
+    private hasFreshRequiredJoinRequest(userTelegramId: string, channelTelegramId: string): boolean {
+        const channelMap = this.requiredJoinRequestMarks.get(userTelegramId);
+        if (!channelMap) {
+            return false;
+        }
+
+        const markedAt = channelMap.get(channelTelegramId);
+        if (!markedAt) {
+            return false;
+        }
+
+        if (Date.now() - markedAt > this.requiredJoinRequestTtlMs) {
+            channelMap.delete(channelTelegramId);
+            if (channelMap.size === 0) {
+                this.requiredJoinRequestMarks.delete(userTelegramId);
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    private clearRequiredJoinRequestMark(userTelegramId: string, channelTelegramId: string): void {
+        const channelMap = this.requiredJoinRequestMarks.get(userTelegramId);
+        if (!channelMap) {
+            return;
+        }
+
+        channelMap.delete(channelTelegramId);
+        if (channelMap.size === 0) {
+            this.requiredJoinRequestMarks.delete(userTelegramId);
+        }
     }
 
     private resolveChannelJoinLink(channel: RequiredChannelInfo): string | null {
@@ -2214,6 +2468,10 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
                 continue;
             }
 
+            if (this.hasFreshRequiredJoinRequest(telegramId, channel.telegramId)) {
+                continue;
+            }
+
             if (!this.bot) {
                 missingTelegram.push(info);
                 continue;
@@ -2239,6 +2497,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
                 if (!joined) {
                     missingTelegram.push(info);
+                } else {
+                    this.clearRequiredJoinRequestMark(telegramId, channel.telegramId);
                 }
             } catch {
                 missingTelegram.push(info);
@@ -2311,32 +2571,26 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     private async sendPrivateChannelAccessByUser(user: User): Promise<void> {
         if (!this.bot) return;
 
+        const configuredLink = await this.getSetting(SETTING_PRIVATE_CHANNEL_LINK);
+        const fallbackLink = configuredLink ? this.normalizeTelegramLink(configuredLink) : null;
+
         const privateChannel = await this.prisma.channel.findFirst({
             where: { type: ChannelType.PRIVATE_ACCESS, isActive: true },
         });
-
-        const configuredLink = await this.getSetting(SETTING_PRIVATE_CHANNEL_LINK);
-        const manualLink = configuredLink ? this.normalizeTelegramLink(configuredLink) : null;
-        if (manualLink) {
-            if (privateChannel) {
-                await this.issuePrivateAccessGrant(user.id, privateChannel.telegramId, manualLink);
-            } else {
-                this.logger.warn(
-                    `Private kanal ID o'rnatilmagan, grant yozuvi saqlanmadi (user: ${user.telegramId})`,
-                );
-            }
-
-            await this.notifyUser(
-                user.telegramId,
-                `Yopiq kanalga kirish uchun link:\n${manualLink}\n\nLink orqali kirib, so‘rov yuboring.`,
-            );
-            return;
-        }
 
         if (!privateChannel) {
             await this.notifyUser(
                 user.telegramId,
                 'Ruxsat berildi, lekin yopiq kanal admin tomonidan hali sozlanmagan.',
+            );
+            return;
+        }
+
+        const botIsAdmin = await this.isBotAdminInChannel(privateChannel.telegramId);
+        if (!botIsAdmin) {
+            await this.notifyUser(
+                user.telegramId,
+                'Ruxsat berildi, lekin bot hali private kanalda admin emas. Iltimos, adminga yozing.',
             );
             return;
         }
@@ -2355,6 +2609,16 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             );
         } catch (error) {
             this.logger.warn(`Yopiq kanal linki yaratilmagan: ${String(error)}`);
+
+            if (fallbackLink) {
+                await this.issuePrivateAccessGrant(user.id, privateChannel.telegramId, fallbackLink);
+                await this.notifyUser(
+                    user.telegramId,
+                    `Sizga ruxsat berildi. Kanalga kirish uchun link:\n${fallbackLink}\nSo‘rov yuboring, bot avtomatik tasdiqlaydi.`,
+                );
+                return;
+            }
+
             await this.notifyUser(
                 user.telegramId,
                 'Ruxsat berildi, lekin link yaratishda xatolik bo‘ldi. Iltimos, adminga yozing.',

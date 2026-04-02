@@ -2741,11 +2741,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             );
             return;
         }
-
-        await this.notifyUser(
-            inviter.telegramId,
-            `Yangi referral qo‘shildi. Jami takliflaringiz: ${inviter.invitedCount}`,
-        );
     }
 
     private async isEligible(userId: number): Promise<boolean> {

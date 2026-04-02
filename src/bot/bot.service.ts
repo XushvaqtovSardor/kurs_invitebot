@@ -2822,7 +2822,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
             await this.notifyUser(
                 user.telegramId,
-                `Sizga ruxsat berildi. Kanalga kirish uchun havola:\n${invite.invite_link}\nSo‘rov yuboring, bot avtomatik tasdiqlaydi.`,
+                `Sizga ruxsat berildi. Kanalga kirish uchun havola:\n${invite.invite_link}\nSo‘rov yuboring`,
             );
         } catch (error) {
             this.logger.warn(`Yopiq kanal linki yaratilmagan: ${String(error)}`);
@@ -2831,7 +2831,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
                 await this.issuePrivateAccessGrant(user.id, privateChannel.telegramId, fallbackLink);
                 await this.notifyUser(
                     user.telegramId,
-                    `Sizga ruxsat berildi. Kanalga kirish uchun link:\n${fallbackLink}\nSo‘rov yuboring, bot avtomatik tasdiqlaydi.`,
+                    `Sizga ruxsat berildi. Kanalga kirish uchun link:\n${fallbackLink}\nSo‘rov yuboring`,
                 );
                 return;
             }

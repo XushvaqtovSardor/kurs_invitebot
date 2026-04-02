@@ -193,10 +193,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             await this.promptAddAdmin(ctx);
         });
 
-        this.bot.on('inline_query', async (ctx) => {
-            await this.handleInlineReferralShare(ctx);
-        });
-
         // Inline keyboards
         this.bot.callbackQuery('gate:check', async (ctx) => {
             await ctx.answerCallbackQuery();
@@ -1830,22 +1826,17 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         const goal = await this.getReferralGoal();
         const link = this.buildReferralLink(user.referralCode);
         const messageText = await this.buildReferralMessageText(user, link, goal);
-        const shareUrl = this.buildTelegramShareUrl(link, this.getDefaultReferralShareText());
-        const inlineKeyboard = new InlineKeyboard().url('♻️ Ulashish', shareUrl);
 
         const posterFileId = await this.getSetting(SETTING_REFERRAL_POSTER_FILE_ID);
 
         if (posterFileId) {
             await ctx.replyWithPhoto(posterFileId, {
                 caption: this.fitCaptionWithLink(messageText, link),
-                reply_markup: inlineKeyboard,
             });
             return;
         }
 
-        await ctx.reply(messageText, {
-            reply_markup: inlineKeyboard,
-        });
+        await ctx.reply(messageText);
     }
 
     private buildReferralLink(referralCode: string): string {
@@ -1881,11 +1872,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         return null;
     }
 
-    private buildTelegramShareUrl(url: string, text: string): string {
-        const params = new URLSearchParams({ url, text });
-        return `https://t.me/share/url?${params.toString()}`;
-    }
-
     private getDefaultReferralTemplate(): string {
         return [
             '🧪 KIMYO fanidan BEPUL TEZKOR DTM kursiga start berildi!',
@@ -1905,12 +1891,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             '',
             '🚀 Hoziroq boshlang va natijaga erishing!',
             '',
-            '👇 Quyidagi tugmani bosing va taklif qilishni boshlang',
+            '👇 Havolani do‘stlaringizga yuborib, taklif qilishni boshlang',
         ].join('\n');
-    }
-
-    private getDefaultReferralShareText(): string {
-        return 'Siz kurslarni olish uchun botga taklif buyuring 👇';
     }
 
     private async buildReferralMessageText(user: User, link: string, goal: number): Promise<string> {
@@ -1952,75 +1934,6 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         }
 
         return `${fullText.slice(0, maxBody)}...${suffix}`;
-    }
-
-    private async handleInlineReferralShare(ctx: Context): Promise<void> {
-        if (!ctx.from || !ctx.inlineQuery) {
-            return;
-        }
-
-        const user = await this.findUserByTelegramId(ctx.from.id);
-        if (!user) {
-            await ctx.answerInlineQuery([], { cache_time: 5, is_personal: true });
-            return;
-        }
-
-        const required = await this.checkRequiredChannels(user.telegramId);
-        if (!required.ok) {
-            await ctx.answerInlineQuery(
-                [
-                    {
-                        type: 'article',
-                        id: `required-${user.id}`,
-                        title: 'Avval majburiy kanallarga obuna bo‘ling',
-                        description: 'Botga qaytib "✅ A’zo bo‘ldim" tugmasini bosing.',
-                        input_message_content: {
-                            message_text:
-                                'Avval botga qayting va majburiy havolalarga obuna bo‘lib, "✅ A’zo bo‘ldim" tugmasini bosing.',
-                        },
-                    },
-                ],
-                { cache_time: 5, is_personal: true },
-            );
-            return;
-        }
-
-        const goal = await this.getReferralGoal();
-        const link = this.buildReferralLink(user.referralCode);
-        const messageText = await this.buildReferralMessageText(user, link, goal);
-        const posterFileId = await this.getSetting(SETTING_REFERRAL_POSTER_FILE_ID);
-        const resultSuffix = `${user.id}-${Date.now()}`;
-
-        if (posterFileId) {
-            // @grammyjs/types in this project does not include cached_* inline variants.
-            const cachedPhotoResult = {
-                type: 'cached_photo',
-                id: `ref-photo-${resultSuffix}`,
-                photo_file_id: posterFileId,
-                caption: this.fitCaptionWithLink(messageText, link),
-            } as any;
-
-            await ctx.answerInlineQuery(
-                [cachedPhotoResult],
-                { cache_time: 0, is_personal: true },
-            );
-            return;
-        }
-
-        await ctx.answerInlineQuery(
-            [
-                {
-                    type: 'article',
-                    id: `ref-article-${resultSuffix}`,
-                    title: 'Referral postini ulashish',
-                    description: 'Matn va havola bilan yuborish',
-                    input_message_content: {
-                        message_text: messageText,
-                    },
-                },
-            ],
-            { cache_time: 0, is_personal: true },
-        );
     }
 
     private async getOrCreateUser(tgUser: Context['from'], payload?: string): Promise<User> {
@@ -2798,23 +2711,41 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         });
         if (mark.count === 0) return;
 
-        const inviter = await this.prisma.user.update({
+        const inviterBefore = await this.prisma.user.findUnique({
             where: { id: user.referredById },
+            select: {
+                id: true,
+                telegramId: true,
+                invitedCount: true,
+                accessGranted: true,
+            },
+        });
+        if (!inviterBefore) return;
+
+        const inviter = await this.prisma.user.update({
+            where: { id: inviterBefore.id },
             data: { invitedCount: { increment: 1 } },
         });
+
+        if (inviterBefore.accessGranted) {
+            return;
+        }
+
+        const goal = await this.getReferralGoal();
+        const reachedGoalNow = inviterBefore.invitedCount < goal && inviter.invitedCount >= goal;
+
+        if (reachedGoalNow) {
+            await this.grantAccessAndNotify(
+                inviter.id,
+                `Tabriklaymiz. Siz ${goal} ta referralga yetdingiz va yopiq kanalga kirish huquqini oldingiz!`,
+            );
+            return;
+        }
 
         await this.notifyUser(
             inviter.telegramId,
             `Yangi referral qo‘shildi. Jami takliflaringiz: ${inviter.invitedCount}`,
         );
-
-        const goal = await this.getReferralGoal();
-        if (inviter.invitedCount >= goal) {
-            await this.grantAccessAndNotify(
-                inviter.id,
-                `Tabriklaymiz. Siz ${goal} ta referralga yetdingiz va yopiq kanalga kirish huquqini oldingiz!`,
-            );
-        }
     }
 
     private async isEligible(userId: number): Promise<boolean> {
@@ -2835,10 +2766,21 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     }
 
     private async grantAccessAndNotify(userId: number, text: string): Promise<void> {
-        const user = await this.prisma.user.update({
-            where: { id: userId },
+        const grant = await this.prisma.user.updateMany({
+            where: {
+                id: userId,
+                accessGranted: false,
+            },
             data: { accessGranted: true },
         });
+
+        if (grant.count === 0) {
+            return;
+        }
+
+        const user = await this.prisma.user.findUnique({ where: { id: userId } });
+        if (!user) return;
+
         await this.notifyUser(user.telegramId, text);
         await this.sendPrivateChannelAccessByUser(user);
     }

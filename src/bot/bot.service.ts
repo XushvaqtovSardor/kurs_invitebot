@@ -18,6 +18,11 @@ const SETTING_PRIVATE_CHANNEL_LINK = 'private_channel_link';
 const SETTING_REFERRAL_POSTER_FILE_ID = 'referral_poster_file_id';
 const SETTING_REFERRAL_TEXT = 'referral_text';
 const SETTING_DYNAMIC_ADMIN_IDS = 'dynamic_admin_ids';
+const ADMIN_STATS_PAGE_SIZE = 10;
+const ADMIN_USERS_PAGE_SIZE = 15;
+const ADMIN_SUPPORT_USERS_PAGE_SIZE = 12;
+const ADMIN_SUPPORT_HISTORY_PAGE_SIZE = 8;
+const ADMIN_PAYMENTS_PAGE_SIZE = 15;
 
 type AdminPendingAction =
     | 'SET_PRIVATE_LINK'
@@ -257,6 +262,24 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             await this.showSupportList(ctx);
         });
 
+        this.bot.callbackQuery(/^admin:stats:page:(\d+)$/, async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await ctx.answerCallbackQuery();
+            await this.showAdminInfo(ctx, Number(ctx.match[1]));
+        });
+
+        this.bot.callbackQuery(/^admin:users:page:(\d+)$/, async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await ctx.answerCallbackQuery();
+            await this.showTopUsers(ctx, Number(ctx.match[1]));
+        });
+
+        this.bot.callbackQuery(/^admin:messages:page:(\d+)$/, async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await ctx.answerCallbackQuery();
+            await this.showSupportList(ctx, Number(ctx.match[1]));
+        });
+
         this.bot.callbackQuery('admin:set_private_link', async (ctx) => {
             if (!(await this.ensureAdmin(ctx))) return;
             await ctx.answerCallbackQuery();
@@ -440,30 +463,18 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             await this.showRequiredChannelsDeleteMenu(ctx);
         });
 
+        this.bot.callbackQuery(/^pay:list:(PENDING|APPROVED|REJECTED):page:(\d+)$/, async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await ctx.answerCallbackQuery();
+            const status = ctx.match[1] as PaymentStatus;
+            await this.showPayments(ctx, status, Number(ctx.match[2]));
+        });
+
         this.bot.callbackQuery(/^pay:list:(PENDING|APPROVED|REJECTED)$/, async (ctx) => {
             if (!(await this.ensureAdmin(ctx))) return;
             await ctx.answerCallbackQuery();
             const status = ctx.match[1] as PaymentStatus;
-            const payments = await this.prisma.payment.findMany({
-                where: { status },
-                include: { user: true },
-                orderBy: { createdAt: 'desc' },
-                take: 20,
-            });
-            if (!payments.length) {
-                await ctx.reply('Bu holatda to‘lovlar topilmadi.');
-                return;
-            }
-
-            const keyboard = new InlineKeyboard();
-            for (const payment of payments) {
-                keyboard.text(
-                    `#${payment.id} @${payment.user.username ?? payment.user.telegramId}`,
-                    `pay:item:${payment.id}`,
-                );
-                keyboard.row();
-            }
-            await ctx.reply(`${status} ro‘yxati:`, { reply_markup: keyboard });
+            await this.showPayments(ctx, status, 1);
         });
 
         this.bot.callbackQuery(/^pay:item:(\d+)$/, async (ctx) => {
@@ -539,11 +550,28 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             );
         });
 
+        this.bot.callbackQuery(/^msg:user:(\d+):(\d+)$/, async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await ctx.answerCallbackQuery();
+            const userId = Number(ctx.match[1]);
+            const listPage = Number(ctx.match[2]);
+            await this.showSupportHistory(ctx, userId, 1, listPage);
+        });
+
         this.bot.callbackQuery(/^msg:user:(\d+)$/, async (ctx) => {
             if (!(await this.ensureAdmin(ctx))) return;
             await ctx.answerCallbackQuery();
             const userId = Number(ctx.match[1]);
-            await this.showSupportHistory(ctx, userId);
+            await this.showSupportHistory(ctx, userId, 1, 1);
+        });
+
+        this.bot.callbackQuery(/^msg:history:(\d+):(\d+):page:(\d+)$/, async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await ctx.answerCallbackQuery();
+            const userId = Number(ctx.match[1]);
+            const listPage = Number(ctx.match[2]);
+            const page = Number(ctx.match[3]);
+            await this.showSupportHistory(ctx, userId, page, listPage);
         });
 
         this.bot.callbackQuery(/^msg:reply:(\d+)$/, async (ctx) => {
@@ -1776,8 +1804,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             ['👮 Admin qo‘shish', '📣 Reklama yuborish'],
             ['🔐 Linkni o‘rnatish', '🗂 Database kanal'],
             ['💳 To‘lov sozlash', '🖼 Referral posteri'],
-            ['📝 Referral matni'],
-            ['📌 Majburiy kanallar'],
+            ['📝 Referral matni', '📌 Majburiy kanallar'],
         ]).resized();
     }
 
@@ -2048,8 +2075,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         );
     }
 
-    private async showAdminInfo(ctx: Context): Promise<void> {
-        const [userCount, accessCount, approvedPays, pendingPays, rejectedPays, inviteAgg] =
+    private async showAdminInfo(ctx: Context, page = 1): Promise<void> {
+        const [userCount, accessCount, approvedPays, pendingPays, rejectedPays, inviteAgg, topUsersCount] =
             await Promise.all([
                 this.prisma.user.count(),
                 this.prisma.user.count({ where: { accessGranted: true } }),
@@ -2057,63 +2084,95 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
                 this.prisma.payment.count({ where: { status: PaymentStatus.PENDING } }),
                 this.prisma.payment.count({ where: { status: PaymentStatus.REJECTED } }),
                 this.prisma.user.aggregate({ _sum: { invitedCount: true } }),
+                this.prisma.user.count({ where: { invitedCount: { gt: 0 } } }),
             ]);
+
+        const totalPages = Math.max(1, Math.ceil(topUsersCount / ADMIN_STATS_PAGE_SIZE));
+        const currentPage = this.clampPage(page, totalPages);
+        const skip = (currentPage - 1) * ADMIN_STATS_PAGE_SIZE;
 
         const topUsers = await this.prisma.user.findMany({
             where: { invitedCount: { gt: 0 } },
-            orderBy: { invitedCount: 'desc' },
-            take: 10,
+            orderBy: [{ invitedCount: 'desc' }, { createdAt: 'asc' }],
+            skip,
+            take: ADMIN_STATS_PAGE_SIZE,
         });
 
         const totalInvites = inviteAgg._sum.invitedCount ?? 0;
+        const startRank = skip + 1;
         const topBlock = topUsers.length
             ? topUsers
-                .map((user, index) => `${index + 1}. @${user.username ?? user.telegramId} - ${user.invitedCount}`)
+                .map(
+                    (user, index) =>
+                        `${startRank + index}. @${user.username ?? user.telegramId} - ${user.invitedCount}`,
+                )
                 .join('\n')
             : 'Hozircha top userlar yo‘q';
 
-        await ctx.reply(
+        const keyboard = new InlineKeyboard()
+            .text('Kutilayotgan to‘lovlar', 'pay:list:PENDING')
+            .row()
+            .text('Support xabarlari', 'admin:messages');
+
+        if (totalPages > 1) {
+            keyboard.row();
+            this.appendPaginationRow(keyboard, 'admin:stats:page', currentPage, totalPages);
+        }
+
+        await this.replyOrEdit(
+            ctx,
             [
                 'Admin statistikasi:',
                 `Jami userlar: ${userCount}`,
                 `Ruxsat olgan userlar: ${accessCount}`,
                 `Jami takliflar: ${totalInvites}`,
                 '',
-                `To‘lovlar:`,
+                'To‘lovlar:',
                 `- Kutilmoqda: ${pendingPays}`,
                 `- Tasdiqlangan: ${approvedPays}`,
                 `- Rad etilgan: ${rejectedPays}`,
                 '',
-                'Top taklif qilganlar:',
+                `Top taklif qilganlar (sahifa ${currentPage}/${totalPages}):`,
                 topBlock,
             ].join('\n'),
-            {
-                reply_markup: new InlineKeyboard()
-                    .text('Kutilayotgan to‘lovlar', 'pay:list:PENDING')
-                    .row()
-                    .text('Support xabarlari', 'admin:messages'),
-            },
+            keyboard,
         );
     }
 
-    private async showTopUsers(ctx: Context): Promise<void> {
-        const users = await this.prisma.user.findMany({
-            orderBy: [{ invitedCount: 'desc' }, { createdAt: 'asc' }],
-            take: 30,
-        });
-
-        if (!users.length) {
-            await ctx.reply('Userlar topilmadi.');
+    private async showTopUsers(ctx: Context, page = 1): Promise<void> {
+        const totalUsers = await this.prisma.user.count();
+        if (!totalUsers) {
+            await this.replyOrEdit(ctx, 'Userlar topilmadi.');
             return;
         }
 
+        const totalPages = Math.max(1, Math.ceil(totalUsers / ADMIN_USERS_PAGE_SIZE));
+        const currentPage = this.clampPage(page, totalPages);
+        const skip = (currentPage - 1) * ADMIN_USERS_PAGE_SIZE;
+
+        const users = await this.prisma.user.findMany({
+            orderBy: [{ invitedCount: 'desc' }, { createdAt: 'asc' }],
+            skip,
+            take: ADMIN_USERS_PAGE_SIZE,
+        });
+
+        const startRank = skip + 1;
         const lines = users.map((user, index) => {
             const uname = user.username ? `@${user.username}` : user.telegramId;
             const paidAccess = user.accessGranted ? 'access bor' : 'access yo‘q';
-            return `${index + 1}. ${uname} | taklif: ${user.invitedCount} | ${paidAccess}`;
+            return `${startRank + index}. ${uname} | taklif: ${user.invitedCount} | ${paidAccess}`;
         });
 
-        await ctx.reply(`Foydalanuvchilar ro‘yxati:\n\n${lines.join('\n')}`);
+        const keyboard = new InlineKeyboard();
+        if (totalPages > 1) {
+            this.appendPaginationRow(keyboard, 'admin:users:page', currentPage, totalPages);
+        }
+
+        await this.replyOrEdit(
+            ctx,
+            `Foydalanuvchilar ro‘yxati (sahifa ${currentPage}/${totalPages}):\n\n${lines.join('\n')}`,
+            totalPages > 1 ? keyboard : undefined,
+        );
     }
 
     private async showPaymentSections(ctx: Context): Promise<void> {
@@ -2130,89 +2189,257 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     private async showPayments(
         ctx: Context,
         status: PaymentStatus,
-        limitRaw?: string,
+        page = 1,
     ): Promise<void> {
-        const limit = Number(limitRaw);
-        const take = Number.isInteger(limit) && limit > 0 && limit <= 50 ? limit : 20;
+        const totalPayments = await this.prisma.payment.count({ where: { status } });
+        if (!totalPayments) {
+            await this.replyOrEdit(ctx, 'Bu holatda to‘lovlar topilmadi.');
+            return;
+        }
+
+        const totalPages = Math.max(1, Math.ceil(totalPayments / ADMIN_PAYMENTS_PAGE_SIZE));
+        const currentPage = this.clampPage(page, totalPages);
+        const skip = (currentPage - 1) * ADMIN_PAYMENTS_PAGE_SIZE;
 
         const payments = await this.prisma.payment.findMany({
             where: { status },
             include: { user: true },
             orderBy: { createdAt: 'desc' },
-            take,
+            skip,
+            take: ADMIN_PAYMENTS_PAGE_SIZE,
         });
-        if (!payments.length) {
-            await ctx.reply('Bu holatda to‘lovlar topilmadi.');
-            return;
-        }
-
-        const lines = payments.map(
-            (p) =>
-                `#${p.id} @${p.user.username ?? p.user.telegramId} | ${p.amount} | ${this.paymentStatusText(p.status)}`,
-        );
-
-        await ctx.reply(
-            [
-                `To‘lovlar (${status}):`,
-                lines.join('\n'),
-            ].join('\n'),
-        );
-    }
-
-    private async showSupportList(ctx: Context, take = 30): Promise<void> {
-        const users = await this.prisma.user.findMany({
-            where: { messages: { some: { direction: MessageDirection.USER } } },
-            orderBy: { updatedAt: 'desc' },
-            take,
-        });
-
-        if (!users.length) {
-            await ctx.reply('Support xabarlar topilmadi.');
-            return;
-        }
 
         const keyboard = new InlineKeyboard();
-        for (const user of users) {
-            keyboard.text(`@${user.username ?? user.telegramId}`, `msg:user:${user.id}`);
+        for (const payment of payments) {
+            keyboard.text(
+                `#${payment.id} @${payment.user.username ?? payment.user.telegramId}`,
+                `pay:item:${payment.id}`,
+            );
             keyboard.row();
         }
 
-        const lines = users.map((u) => `id:${u.id} @${u.username ?? u.telegramId}`);
-        await ctx.reply(`Support userlar:\n${lines.join('\n')}\n\nUserni tanlab tarix va javob bo‘limiga o‘ting.`, {
-            reply_markup: keyboard,
-        });
+        if (totalPages > 1) {
+            this.appendPaginationRow(
+                keyboard,
+                `pay:list:${status}:page`,
+                currentPage,
+                totalPages,
+            );
+        }
+
+        await this.replyOrEdit(
+            ctx,
+            `${status} ro‘yxati (sahifa ${currentPage}/${totalPages}):`,
+            keyboard,
+        );
     }
 
-    private async showSupportHistory(ctx: Context, userId: number): Promise<void> {
-        const user = await this.prisma.user.findUnique({ where: { id: userId } });
-        if (!user) {
-            await ctx.reply('User topilmadi.');
-            return;
-        }
-
-        const historyDesc = await this.prisma.supportMessage.findMany({
-            where: { userId },
-            orderBy: { createdAt: 'desc' },
-            take: 40,
+    private async showSupportList(ctx: Context, page = 1): Promise<void> {
+        const totalUsers = await this.prisma.user.count({
+            where: { messages: { some: { direction: MessageDirection.USER } } },
         });
 
-        if (!historyDesc.length) {
-            await ctx.reply('Xabarlar topilmadi.');
+        if (!totalUsers) {
+            await this.replyOrEdit(ctx, 'Support xabarlar topilmadi.');
             return;
         }
 
-        const history = [...historyDesc].reverse();
+        const totalPages = Math.max(1, Math.ceil(totalUsers / ADMIN_SUPPORT_USERS_PAGE_SIZE));
+        const currentPage = this.clampPage(page, totalPages);
+        const skip = (currentPage - 1) * ADMIN_SUPPORT_USERS_PAGE_SIZE;
+
+        const users = await this.prisma.user.findMany({
+            where: { messages: { some: { direction: MessageDirection.USER } } },
+            orderBy: { updatedAt: 'desc' },
+            skip,
+            take: ADMIN_SUPPORT_USERS_PAGE_SIZE,
+        });
+
+        const keyboard = new InlineKeyboard();
+        for (const user of users) {
+            const label = user.username
+                ? `@${user.username}`
+                : user.firstName?.trim() || user.telegramId;
+            keyboard.text(label, `msg:user:${user.id}:${currentPage}`);
+            keyboard.row();
+        }
+
+        if (totalPages > 1) {
+            this.appendPaginationRow(keyboard, 'admin:messages:page', currentPage, totalPages);
+        }
+
+        const lines = users.map((u, index) => {
+            const label = u.username ? `@${u.username}` : u.firstName?.trim() || u.telegramId;
+            return `${skip + index + 1}. id:${u.id} ${label}`;
+        });
+
+        await this.replyOrEdit(
+            ctx,
+            [
+                `Support userlar (sahifa ${currentPage}/${totalPages}):`,
+                lines.join('\n'),
+                '',
+                'Userni tanlab tarix va javob bo‘limiga o‘ting.',
+            ].join('\n'),
+            keyboard,
+        );
+    }
+
+    private async showSupportHistory(
+        ctx: Context,
+        userId: number,
+        page = 1,
+        listPage = 1,
+    ): Promise<void> {
+        const user = await this.prisma.user.findUnique({ where: { id: userId } });
+        if (!user) {
+            await this.replyOrEdit(ctx, 'User topilmadi.');
+            return;
+        }
+
+        const safeListPage = Number.isInteger(listPage) && listPage > 0 ? listPage : 1;
+        const totalMessages = await this.prisma.supportMessage.count({ where: { userId } });
+        if (!totalMessages) {
+            await this.replyOrEdit(
+                ctx,
+                'Xabarlar topilmadi.',
+                new InlineKeyboard().text('⬅️ Userlar ro‘yxati', `admin:messages:page:${safeListPage}`),
+            );
+            return;
+        }
+
+        const totalPages = Math.max(1, Math.ceil(totalMessages / ADMIN_SUPPORT_HISTORY_PAGE_SIZE));
+        const currentPage = this.clampPage(page, totalPages);
+        const skip = (currentPage - 1) * ADMIN_SUPPORT_HISTORY_PAGE_SIZE;
+
+        const history = await this.prisma.supportMessage.findMany({
+            where: { userId },
+            orderBy: { createdAt: 'desc' },
+            skip,
+            take: ADMIN_SUPPORT_HISTORY_PAGE_SIZE,
+        });
+
         const body = history
             .map((item) => {
                 const sender = item.direction === MessageDirection.USER ? 'USER' : 'ADMIN';
                 const ts = item.createdAt.toLocaleString('uz-UZ');
-                return `${sender} (${ts}): ${item.text}`;
+                const text = this.truncateForHistory(item.text, 320);
+                return `${sender} (${ts}): ${text}`;
             })
             .join('\n\n');
 
-        await ctx.reply(body, {
-            reply_markup: new InlineKeyboard().text('Javob yozish', `msg:reply:${user.id}`),
-        });
+        const keyboard = new InlineKeyboard().text('Javob yozish', `msg:reply:${user.id}`);
+        if (totalPages > 1) {
+            keyboard.row();
+            this.appendPaginationRow(
+                keyboard,
+                `msg:history:${user.id}:${safeListPage}:page`,
+                currentPage,
+                totalPages,
+            );
+        }
+        keyboard.row().text('⬅️ Userlar ro‘yxati', `admin:messages:page:${safeListPage}`);
+
+        await this.replyOrEdit(
+            ctx,
+            [
+                `Support tarixi: @${user.username ?? user.telegramId}`,
+                `Sahifa: ${currentPage}/${totalPages}`,
+                '',
+                body,
+            ].join('\n'),
+            keyboard,
+        );
+    }
+
+    private clampPage(page: number, totalPages: number): number {
+        if (!Number.isInteger(page) || page < 1) {
+            return 1;
+        }
+
+        if (page > totalPages) {
+            return totalPages;
+        }
+
+        return page;
+    }
+
+    private getPaginationWindow(
+        currentPage: number,
+        totalPages: number,
+        maxButtons = 5,
+    ): number[] {
+        const half = Math.floor(maxButtons / 2);
+        let start = Math.max(1, currentPage - half);
+        let end = Math.min(totalPages, start + maxButtons - 1);
+        start = Math.max(1, end - maxButtons + 1);
+
+        const pages: number[] = [];
+        for (let page = start; page <= end; page += 1) {
+            pages.push(page);
+        }
+
+        return pages;
+    }
+
+    private appendPaginationRow(
+        keyboard: InlineKeyboard,
+        callbackPrefix: string,
+        currentPage: number,
+        totalPages: number,
+    ): void {
+        if (totalPages <= 1) {
+            return;
+        }
+
+        if (currentPage > 1) {
+            keyboard.text('⬅️', `${callbackPrefix}:${currentPage - 1}`);
+        }
+
+        const pages = this.getPaginationWindow(currentPage, totalPages, 5);
+        for (const page of pages) {
+            const label = page === currentPage ? `·${page}·` : String(page);
+            keyboard.text(label, `${callbackPrefix}:${page}`);
+        }
+
+        if (currentPage < totalPages) {
+            keyboard.text('➡️', `${callbackPrefix}:${currentPage + 1}`);
+        }
+    }
+
+    private async replyOrEdit(
+        ctx: Context,
+        text: string,
+        keyboard?: InlineKeyboard,
+    ): Promise<void> {
+        if (ctx.callbackQuery?.message) {
+            try {
+                if (keyboard) {
+                    await ctx.editMessageText(text, { reply_markup: keyboard });
+                } else {
+                    await ctx.editMessageText(text);
+                }
+                return;
+            } catch {
+                // Callback xabarini tahrirlab bo‘lmasa, yangi xabar yuboramiz.
+            }
+        }
+
+        if (keyboard) {
+            await ctx.reply(text, { reply_markup: keyboard });
+            return;
+        }
+
+        await ctx.reply(text);
+    }
+
+    private truncateForHistory(text: string, maxLength: number): string {
+        const normalized = text.trim();
+        if (normalized.length <= maxLength) {
+            return normalized;
+        }
+
+        return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
     }
 
     private async approvePaymentById(

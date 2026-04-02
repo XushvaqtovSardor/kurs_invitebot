@@ -921,9 +921,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         }
 
         const lines = topUsers.map((topUser, index) => {
-            const displayName = topUser.username
-                ? `@${topUser.username}`
-                : topUser.firstName ?? topUser.telegramId;
+            const displayName = topUser.firstName?.trim() || 'Ismi ko‘rsatilmagan';
 
             if (index === 0) {
                 return `🥇 ${displayName} - ${topUser.invitedCount} ta`;

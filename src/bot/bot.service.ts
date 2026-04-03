@@ -23,6 +23,7 @@ const ADMIN_USERS_PAGE_SIZE = 15;
 const ADMIN_SUPPORT_USERS_PAGE_SIZE = 12;
 const ADMIN_SUPPORT_HISTORY_PAGE_SIZE = 8;
 const ADMIN_PAYMENTS_PAGE_SIZE = 15;
+const DEFAULT_REFERRAL_GOAL = 5;
 
 type AdminPendingAction =
     | 'SET_PRIVATE_LINK'
@@ -195,6 +196,14 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         this.bot.hears('📌 Majburiy kanallar', async (ctx) => {
             if (!(await this.ensureAdmin(ctx))) return;
             await this.showRequiredChannelsManager(ctx);
+        });
+        this.bot.hears('🆕 Yangi loyiha boshlash', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await this.promptNewProjectReset(ctx);
+        });
+        this.bot.hears('Yangi loyiha boshlash', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await this.promptNewProjectReset(ctx);
         });
         this.bot.hears('📣 Reklama yuborish', async (ctx) => {
             if (!(await this.ensureAdmin(ctx))) return;
@@ -421,6 +430,24 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             if (!(await this.ensureAdmin(ctx))) return;
             await ctx.answerCallbackQuery();
             await this.showRequiredChannelsManager(ctx);
+        });
+
+        this.bot.callbackQuery('admin:new_project:warn', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await ctx.answerCallbackQuery();
+            await this.promptNewProjectFinalReset(ctx);
+        });
+
+        this.bot.callbackQuery('admin:new_project:apply', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await ctx.answerCallbackQuery();
+            await this.runNewProjectReset(ctx);
+        });
+
+        this.bot.callbackQuery('admin:new_project:cancel', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await ctx.answerCallbackQuery();
+            await this.cancelNewProjectReset(ctx);
         });
 
         this.bot.callbackQuery('admin:broadcast_confirm', async (ctx) => {
@@ -1107,6 +1134,111 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         await ctx.reply('Admin paneliga xush kelibsiz. Bo‘limlardan birini tanlang:', {
             reply_markup: this.adminMenuKeyboard(),
         });
+    }
+
+    private async promptNewProjectReset(ctx: Context): Promise<void> {
+        await ctx.reply(
+            [
+                '⚠️ Yangi loyiha boshlash tasdig‘i',
+                'Hozirgi statistikalar 0 ga tushiriladi va yopiq kanal linki olib tashlanadi.',
+                'Buni qilishni xohlaysizmi?',
+            ].join('\n'),
+            {
+                reply_markup: new InlineKeyboard()
+                    .text('✅ Ha', 'admin:new_project:warn')
+                    .text('❌ Yo‘q', 'admin:new_project:cancel'),
+            },
+        );
+    }
+
+    private async promptNewProjectFinalReset(ctx: Context): Promise<void> {
+        await this.replyOrEdit(
+            ctx,
+            [
+                '❗️Diqqat: bu amal qaytarib bo‘lmaydi.',
+                'Tasdiqlasangiz quyidagilar reset qilinadi:',
+                '- Statistika (takliflar va kirish holati)',
+                '- Yopiq kanal linki va private kanal ID',
+                '- To‘lovlar tarixi',
+                '- Support va private kirish tarixlari',
+                '',
+                'Majburiy kanallar o‘zgarmaydi.',
+                'Davom etasizmi?',
+            ].join('\n'),
+            new InlineKeyboard()
+                .text('✅ Ha', 'admin:new_project:apply')
+                .text('❌ Yo‘q', 'admin:new_project:cancel'),
+        );
+    }
+
+    private async runNewProjectReset(ctx: Context): Promise<void> {
+        if (!ctx.from) return;
+
+        const [
+            usersResult,
+            paymentsResult,
+            supportResult,
+            grantsResult,
+            privateChannelsResult,
+            privateLinkSettingResult,
+        ] = await this.prisma.$transaction([
+            this.prisma.user.updateMany({
+                data: {
+                    invitedCount: 0,
+                    accessGranted: false,
+                    referralCreditedAt: null,
+                    referredById: null,
+                    state: UserState.IDLE,
+                },
+            }),
+            this.prisma.payment.deleteMany({}),
+            this.prisma.supportMessage.deleteMany({}),
+            this.prisma.privateAccessGrant.deleteMany({}),
+            this.prisma.channel.updateMany({
+                where: { type: ChannelType.PRIVATE_ACCESS },
+                data: { isActive: false },
+            }),
+            this.prisma.setting.deleteMany({ where: { key: SETTING_PRIVATE_CHANNEL_LINK } }),
+            this.prisma.setting.upsert({
+                where: { key: SETTING_REFERRAL_GOAL },
+                update: { value: String(DEFAULT_REFERRAL_GOAL) },
+                create: {
+                    key: SETTING_REFERRAL_GOAL,
+                    value: String(DEFAULT_REFERRAL_GOAL),
+                },
+            }),
+        ]);
+
+        this.requiredJoinRequestMarks.clear();
+        this.adminReplyTargets.clear();
+        this.clearAdminSession(String(ctx.from.id));
+
+        const privateConfigCleared =
+            privateChannelsResult.count > 0 || privateLinkSettingResult.count > 0;
+
+        await this.replyOrEdit(
+            ctx,
+            [
+                '✅ Yangi loyiha boshlandi.',
+                `User statistikasi reset qilindi: ${usersResult.count}`,
+                `To‘lovlar tarixi o‘chirildi: ${paymentsResult.count}`,
+                `Support xabarlar o‘chirildi: ${supportResult.count}`,
+                `Private kirish tarixlari o‘chirildi: ${grantsResult.count}`,
+                `Yopiq kanal sozlamalari tozalandi: ${privateConfigCleared ? 'ha' : 'yo‘q'}`,
+                'Majburiy kanallar o‘zgarmadi.',
+                `Referral sharti ${DEFAULT_REFERRAL_GOAL} taga qaytarildi (taklif yoki to‘lov).`,
+                '',
+                'Endi yangi yopiq kanalni o‘rnating.',
+            ].join('\n'),
+        );
+
+        await ctx.reply('Admin panel:', { reply_markup: this.adminMenuKeyboard() });
+    }
+
+    private async cancelNewProjectReset(ctx: Context): Promise<void> {
+        this.clearAdminSession(String(ctx.from?.id ?? ''));
+        await this.replyOrEdit(ctx, 'Yangi loyiha boshlash amali bekor qilindi.');
+        await ctx.reply('Admin panel:', { reply_markup: this.adminMenuKeyboard() });
     }
 
     private clearAdminSession(adminId: string): void {
@@ -1884,7 +2016,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             ['🔐 Linkni o‘rnatish', '🗂 Database kanal'],
             ['🔢 Sonni o‘zgartirish', '💳 To‘lov sozlash'],
             ['🖼 Referral posteri', '📝 Referral matni'],
-            ['📌 Majburiy kanallar'],
+            ['📌 Majburiy kanallar', '🆕 Yangi loyiha boshlash'],
         ]).resized();
     }
 
@@ -2591,7 +2723,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     private async getReferralGoal(): Promise<number> {
         const value = await this.getSetting(SETTING_REFERRAL_GOAL);
         const parsed = Number(value);
-        return Number.isInteger(parsed) && parsed > 0 ? parsed : 5;
+        return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_REFERRAL_GOAL;
     }
 
     private async getSetting(key: string): Promise<string | null> {

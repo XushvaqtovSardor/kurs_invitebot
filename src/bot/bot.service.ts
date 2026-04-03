@@ -28,10 +28,12 @@ type AdminPendingAction =
     | 'SET_PRIVATE_LINK'
     | 'SET_PRIVATE_CHANNEL_ID'
     | 'SET_DATABASE_CHANNEL'
+    | 'SET_DATABASE_CHANNEL_LINK'
     | 'SET_REFERRAL_POSTER'
     | 'SET_PAYMENT_CARD'
     | 'SET_PAYMENT_OWNER'
     | 'SET_PAYMENT_AMOUNT'
+    | 'SET_REFERRAL_GOAL'
     | 'SET_REFERRAL_TEXT'
     | 'ADD_ADMIN'
     | 'PREPARE_BROADCAST_TEXT'
@@ -54,6 +56,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     private readonly adminPendingActions = new Map<string, AdminPendingAction>();
     private readonly adminPaymentDrafts = new Map<string, { card: string; owner: string }>();
     private readonly adminRequiredDrafts = new Map<string, { chatId?: string; url?: string }>();
+    private readonly adminArchiveDrafts = new Map<string, { chatId?: string }>();
     private readonly adminBroadcastDrafts = new Map<string, { text: string }>();
     private readonly dynamicAdminIds = new Set<number>();
     private readonly requiredJoinRequestMarks = new Map<string, Map<string, number>>();
@@ -160,6 +163,14 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         this.bot.hears('🗂 Database kanal', async (ctx) => {
             if (!(await this.ensureAdmin(ctx))) return;
             await this.showDatabaseChannelManager(ctx);
+        });
+        this.bot.hears('🔢 Sonni o‘zgartirish', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await this.promptSetReferralGoal(ctx);
+        });
+        this.bot.hears('Sonni o‘zgartirish', async (ctx) => {
+            if (!(await this.ensureAdmin(ctx))) return;
+            await this.promptSetReferralGoal(ctx);
         });
         this.bot.hears('💳 To‘lov sozlash', async (ctx) => {
             if (!(await this.ensureAdmin(ctx))) return;
@@ -1103,6 +1114,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         this.adminPendingActions.delete(adminId);
         this.adminPaymentDrafts.delete(adminId);
         this.adminRequiredDrafts.delete(adminId);
+        this.adminArchiveDrafts.delete(adminId);
         this.adminBroadcastDrafts.delete(adminId);
     }
 
@@ -1144,11 +1156,16 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         const archiveChannel = await this.prisma.channel.findFirst({
             where: { type: ChannelType.RECEIPT_ARCHIVE, isActive: true },
         });
+        const botAdmin = archiveChannel
+            ? await this.isBotAdminInChannel(archiveChannel.telegramId)
+            : false;
 
         await ctx.reply(
             [
                 'Database kanal boshqaruvi:',
                 `Joriy kanal ID: ${archiveChannel?.telegramId ?? 'o‘rnatilmagan'}`,
+                `Kanal linki: ${archiveChannel?.username ?? 'o‘rnatilmagan'}`,
+                `Bot adminligi: ${botAdmin ? 'tasdiqlangan ✅' : 'tasdiqlanmagan ❌'}`,
                 '',
                 'Qaysi amalni bajarasiz?',
             ].join('\n'),
@@ -1349,7 +1366,19 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         this.clearAdminSession(String(ctx.from.id));
         this.adminPendingActions.set(String(ctx.from.id), 'SET_DATABASE_CHANNEL');
         await ctx.reply(
-            'Database kanal ID ni yuboring.\nNamuna: -1001234567890',
+            'Database kanal ID ni yuboring.\nNamuna: -1001234567890\nBot shu kanalda admin bo‘lishi shart.',
+            { reply_markup: this.cancelKeyboard() },
+        );
+    }
+
+    private async promptSetReferralGoal(ctx: Context): Promise<void> {
+        if (!ctx.from) return;
+        const adminId = String(ctx.from.id);
+        this.clearAdminSession(adminId);
+        this.adminPendingActions.set(adminId, 'SET_REFERRAL_GOAL');
+        const currentGoal = await this.getReferralGoal();
+        await ctx.reply(
+            `Hozirgi standart son: ${currentGoal}\nYangi sonni kiriting (masalan: 5).`,
             { reply_markup: this.cancelKeyboard() },
         );
     }
@@ -1649,11 +1678,61 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
                 return true;
             }
 
-            await this.setArchiveChannel(text);
+            try {
+                await this.ensureBotAdminInChannelOrThrow(text);
+                this.adminArchiveDrafts.set(adminId, { chatId: text });
+                this.adminPendingActions.set(adminId, 'SET_DATABASE_CHANNEL_LINK');
+                await ctx.reply(
+                    'Kanal ID saqlandi va bot adminligi tasdiqlandi.\nEndi kanal linkini yuboring (@username yoki https://t.me/...).',
+                    { reply_markup: this.cancelKeyboard() },
+                );
+            } catch (error) {
+                const message =
+                    error instanceof Error ? error.message : 'Database kanalni tekshirib bo‘lmadi.';
+                await ctx.reply(message);
+            }
+            return true;
+        }
+
+        if (action === 'SET_DATABASE_CHANNEL_LINK') {
+            const draft = this.adminArchiveDrafts.get(adminId);
+            const chatId = draft?.chatId;
+            if (!chatId) {
+                this.adminPendingActions.set(adminId, 'SET_DATABASE_CHANNEL');
+                await ctx.reply('Session topilmadi. Qaytadan kanal ID ni yuboring.', {
+                    reply_markup: this.cancelKeyboard(),
+                });
+                return true;
+            }
+
+            const normalized = this.normalizeTelegramLink(text);
+            if (!normalized) {
+                await ctx.reply('Link noto‘g‘ri. Namuna: @channel yoki https://t.me/channel');
+                return true;
+            }
+
+            await this.setArchiveChannel(chatId, normalized);
             this.clearAdminSession(adminId);
-            await ctx.reply('Database kanal saqlandi.', {
+            await ctx.reply('Database kanal ID va link saqlandi.', {
                 reply_markup: this.adminMenuKeyboard(),
             });
+            await this.showDatabaseChannelManager(ctx);
+            return true;
+        }
+
+        if (action === 'SET_REFERRAL_GOAL') {
+            const parsed = Number(text.replace(/\s+/g, ''));
+            if (!Number.isInteger(parsed) || parsed <= 0) {
+                await ctx.reply('Son noto‘g‘ri. Musbat butun son kiriting. Masalan: 5');
+                return true;
+            }
+
+            await this.setSetting(SETTING_REFERRAL_GOAL, String(parsed));
+            this.clearAdminSession(adminId);
+            await ctx.reply(
+                `Standart referral soni yangilandi: ${parsed}\nEndi shu songa yetganda yopiq kanal linki beriladi.`,
+                { reply_markup: this.adminMenuKeyboard() },
+            );
             return true;
         }
 
@@ -1803,8 +1882,9 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
             ['🧾 To‘lovlar', '💬 Xabarlar'],
             ['👮 Admin qo‘shish', '📣 Reklama yuborish'],
             ['🔐 Linkni o‘rnatish', '🗂 Database kanal'],
-            ['💳 To‘lov sozlash', '🖼 Referral posteri'],
-            ['📝 Referral matni', '📌 Majburiy kanallar'],
+            ['🔢 Sonni o‘zgartirish', '💳 To‘lov sozlash'],
+            ['🖼 Referral posteri', '📝 Referral matni'],
+            ['📌 Majburiy kanallar'],
         ]).resized();
     }
 
@@ -3109,6 +3189,12 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         });
         if (!archive) return;
 
+        const botIsAdmin = await this.isBotAdminInChannel(archive.telegramId);
+        if (!botIsAdmin) {
+            this.logger.warn(`Arxiv kanaliga yuborilmadi: bot admin emas (${archive.telegramId})`);
+            return;
+        }
+
         try {
             await this.bot.api.sendPhoto(Number(archive.telegramId), fileId, {
                 caption: `Payment #${paymentId} | user: ${userTelegramId}`,
@@ -3135,15 +3221,24 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         }
     }
 
-    private async setArchiveChannel(chatId: string): Promise<void> {
+    private async setArchiveChannel(chatId: string, link: string): Promise<void> {
         await this.prisma.channel.updateMany({
             where: { type: ChannelType.RECEIPT_ARCHIVE },
             data: { isActive: false },
         });
         await this.prisma.channel.upsert({
             where: { telegramId: chatId },
-            update: { type: ChannelType.RECEIPT_ARCHIVE, isActive: true },
-            create: { telegramId: chatId, type: ChannelType.RECEIPT_ARCHIVE, isActive: true },
+            update: {
+                type: ChannelType.RECEIPT_ARCHIVE,
+                isActive: true,
+                username: link,
+            },
+            create: {
+                telegramId: chatId,
+                type: ChannelType.RECEIPT_ARCHIVE,
+                isActive: true,
+                username: link,
+            },
         });
     }
 
